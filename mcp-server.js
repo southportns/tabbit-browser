@@ -22,6 +22,7 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = parseInt(process.env.TABBIT_PORT || '9222', 10);
+const CDP_TIMEOUT = parseInt(process.env.TABBIT_CDP_TIMEOUT || '60000', 10);
 const COOKIES_DIR = path.join(process.env.HOME || process.env.USERPROFILE, '.tabbit-browser');
 
 // ─── 反检测脚本 ────────────────────────────────────────────
@@ -99,7 +100,7 @@ class CDP {
   send(method, params = {}) {
     return new Promise((resolve, reject) => {
       const id = ++this.msgId;
-      const timer = setTimeout(() => { this.handlers.delete(id); reject(new Error(`CDP timeout: ${method}`)); }, 30000);
+      const timer = setTimeout(() => { this.handlers.delete(id); reject(new Error(`CDP timeout: ${method}`)); }, CDP_TIMEOUT);
       this.handlers.set(id, { resolve, reject, timer });
       this.ws.send(JSON.stringify({ id, method, params }));
     });
