@@ -58,12 +58,12 @@ const ANTIDETECT_SCRIPT = `
 
 function sendResponse(id, result) {
   const msg = JSON.stringify({ jsonrpc: '2.0', id, result });
-  process.stdout.write(`Content-Length: ${Buffer.byteLength(msg)}\r\n\r\n${msg}`);
+  process.stdout.write(msg + '\n');
 }
 
 function sendError(id, code, message) {
   const msg = JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } });
-  process.stdout.write(`Content-Length: ${Buffer.byteLength(msg)}\r\n\r\n${msg}`);
+  process.stdout.write(msg + '\n');
 }
 
 // ─── CDP 辅助 ──────────────────────────────────────────────
