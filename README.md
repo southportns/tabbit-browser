@@ -11,6 +11,10 @@ Tabbit 浏览器的 MCP (Model Context Protocol) Server，让 AI Agent 直接操
 - **存储管理** - 登录态导出/导入、localStorage 管理、一键清除
 - **高级输入** - 鼠标点击、键盘输入、快捷键、滚动、拖拽
 - **多标签管理** - 并行操控多个标签页
+- **智能导航** - 自动反检测注入、防风控等待、自动滚动
+- **结构化提取** - 商品列表、表格、链接、图片等结构化数据提取
+- **反检测** - 自动隐藏自动化标记（webdriver/CDP 检测）
+- **Cookie 持久化** - 保存/加载/批量管理站点 Cookie
 
 ## 安装
 
@@ -66,7 +70,7 @@ command = "node"
 args = ["/path/to/tabbit-browser/mcp-server.js"]
 ```
 
-## MCP 工具列表
+## MCP 工具列表 (15 个)
 
 | 工具 | 说明 |
 |------|------|
@@ -78,6 +82,13 @@ args = ["/path/to/tabbit-browser/mcp-server.js"]
 | `tabbit_storage` | 存储管理（登录态导出/导入） |
 | `tabbit_input` | 高级输入（点击/键盘/拖拽） |
 | `tabbit_tabs` | 多标签管理 |
+| `tabbit_status` | 连接状态 |
+| `tabbit_launch` | 启动 Tabbit 浏览器 |
+| `tabbit_new` | 打开新对话 |
+| `tabbit_navigate` | 智能导航（自动反检测+滚动） |
+| `tabbit_extract` | 结构化数据提取（商品/表格/链接/图片） |
+| `tabbit_antidetect` | 注入反检测脚本 |
+| `tabbit_cookies` | Cookie 持久化（保存/加载/批量管理） |
 | `tabbit_status` | 检查连接状态 |
 | `tabbit_launch` | 启动 Tabbit 浏览器 |
 | `tabbit_new` | 打开新对话 |
