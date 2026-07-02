@@ -296,6 +296,29 @@ const TOOLS = [
       required: ['action'],
     },
   },
+  {
+    name: 'tabbit_console',
+    description: '控制台日志抓取：查看/过滤/清空浏览器控制台输出。用于项目调试。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list', 'clear', 'errors', 'warnings', 'logs'],
+          description: '操作类型: list=全部, errors=仅错误, warnings=仅警告, logs=仅日志, clear=清空',
+        },
+        type: {
+          type: 'string',
+          enum: ['log', 'info', 'warning', 'error', 'debug'],
+          description: '按类型过滤 (list 时使用)',
+        },
+        limit: { type: 'number', description: '最大返回条数，默认 50' },
+        search: { type: 'string', description: '按关键词搜索日志内容' },
+        includePreserved: { type: 'boolean', description: '是否包含历史导航的日志，默认 false' },
+      },
+      required: ['action'],
+    },
+  },
 ];
 
 // ─── 工具执行 ──────────────────────────────────────────────
@@ -597,6 +620,148 @@ async function executeTool(name, args) {
             return { content: [{ type: 'text', text: `加载 ${files.length} 个文件的 ${total} 个 cookies` }] };
           }
           default: throw new Error(`未知操作: ${args.action}`);
+        }
+      }
+
+      // === 增强: 控制台日志 ===
+      case 'tabbit_console': {
+        const target = await findPage(client);
+        const session = await client.connectTo(target);
+
+        // 启用 Console 域
+        await session.send('Console.enable');
+        await session.send('Log.enable');
+
+        switch (args.action) {
+          case 'list':
+          case 'errors':
+          case 'warnings':
+          case 'logs': {
+            // 确定过滤类型
+            let filterType = args.type;
+            if (args.action === 'errors') filterType = 'error';
+            else if (args.action === 'warnings') filterType = 'warning';
+            else if (args.action === 'logs') filterType = 'log';
+
+            const limit = args.limit || 50;
+            const search = args.search || '';
+            const includePreserved = args.includePreserved || false;
+
+            // 通过 JS 获取控制台日志（需要先注入日志捕获器）
+            const result = await session.send('Runtime.evaluate', {
+              expression: `(() => {
+                // 从 window.__tabbit_logs 获取已捕获的日志
+                const logs = window.__tabbit_logs || [];
+                let filtered = logs;
+
+                // 按类型过滤
+                if (${filterType ? `'${filterType}'` : 'null'}) {
+                  filtered = filtered.filter(l => l.type === '${filterType || ''}');
+                }
+
+                // 按关键词搜索
+                if (${search ? `'${search}'` : 'null'}) {
+                  const keyword = '${search || ''}'.toLowerCase();
+                  filtered = filtered.filter(l => l.text.toLowerCase().includes(keyword));
+                }
+
+                return JSON.stringify(filtered.slice(-${limit}));
+              })()`,
+              returnByValue: true,
+            });
+
+            let logs = [];
+            try { logs = JSON.parse(result.result?.value || '[]'); } catch {}
+
+            // 如果没有捕获到日志，尝试通过 LogDomain 获取
+            if (logs.length === 0) {
+              // 注入日志捕获器并重新获取
+              await session.send('Runtime.evaluate', {
+                expression: `
+                  if (!window.__tabbit_logs) {
+                    window.__tabbit_logs = [];
+                    const origLog = console.log;
+                    const origWarn = console.warn;
+                    const origError = console.error;
+                    const origInfo = console.info;
+                    const origDebug = console.debug;
+
+                    console.log = function() {
+                      window.__tabbit_logs.push({type:'log', text:[...arguments].map(a=>typeof a==='object'?JSON.stringify(a):String(a)).join(' '), time:Date.now()});
+                      origLog.apply(console, arguments);
+                    };
+                    console.warn = function() {
+                      window.__tabbit_logs.push({type:'warning', text:[...arguments].map(a=>typeof a==='object'?JSON.stringify(a):String(a)).join(' '), time:Date.now()});
+                      origWarn.apply(console, arguments);
+                    };
+                    console.error = function() {
+                      window.__tabbit_logs.push({type:'error', text:[...arguments].map(a=>typeof a==='object'?JSON.stringify(a):String(a)).join(' '), time:Date.now()});
+                      origError.apply(console, arguments);
+                    };
+                    console.info = function() {
+                      window.__tabbit_logs.push({type:'info', text:[...arguments].map(a=>typeof a==='object'?JSON.stringify(a):String(a)).join(' '), time:Date.now()});
+                      origInfo.apply(console, arguments);
+                    };
+                    console.debug = function() {
+                      window.__tabbit_logs.push({type:'debug', text:[...arguments].map(a=>typeof a==='object'?JSON.stringify(a):String(a)).join(' '), time:Date.now()});
+                      origDebug.apply(console, arguments);
+                    };
+
+                    // 捕获未处理错误
+                    window.addEventListener('error', (e) => {
+                      window.__tabbit_logs.push({type:'error', text:'[Uncaught] ' + e.message + ' at ' + e.filename + ':' + e.lineno, time:Date.now()});
+                    });
+                    window.addEventListener('unhandledrejection', (e) => {
+                      window.__tabbit_logs.push({type:'error', text:'[UnhandledRejection] ' + (e.reason?.message || e.reason || 'unknown'), time:Date.now()});
+                    });
+                  }
+                `,
+                returnByValue: true,
+              });
+
+              // 获取页面已有的错误（通过 Runtime.evaluate 获取）
+              const existingErrors = await session.send('Runtime.evaluate', {
+                expression: `JSON.stringify(window.__tabbit_logs || [])`,
+                returnByValue: true,
+              });
+              try { logs = JSON.parse(existingErrors.result?.value || '[]'); } catch {}
+            }
+
+            // 格式化输出
+            if (logs.length === 0) {
+              session.close();
+              return { content: [{ type: 'text', text: '(无控制台日志)\n注意: 日志捕获器已注入，后续的 console 输出将被记录。' }] };
+            }
+
+            // 过滤
+            if (filterType) logs = logs.filter(l => l.type === filterType);
+            if (search) {
+              const keyword = search.toLowerCase();
+              logs = logs.filter(l => l.text.toLowerCase().includes(keyword));
+            }
+
+            const output = logs.slice(-limit).map(l => {
+              const time = new Date(l.time).toLocaleTimeString();
+              const icon = { log: '📝', info: 'ℹ️', warning: '⚠️', error: '❌', debug: '🔍' }[l.type] || '📝';
+              return `[${time}] ${icon} ${l.type}: ${l.text.substring(0, 200)}`;
+            }).join('\n');
+
+            session.close();
+            return { content: [{ type: 'text', text: output }], logs };
+          }
+
+          case 'clear': {
+            await session.send('Runtime.evaluate', {
+              expression: 'window.__tabbit_logs = []',
+              returnByValue: true,
+            });
+            session.close();
+            return { content: [{ type: 'text', text: '控制台日志已清空' }] };
+          }
+
+          default:
+            session.close();
+            throw new Error(`未知操作: ${args.action}`);
         }
       }
 
