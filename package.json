@@ -1,0 +1,33 @@
+{
+  "name": "tabbit-browser",
+  "version": "2.0.0",
+  "description": "Tabbit Browser 全功能 CDP 自动化工具 - 网络拦截/设备仿真/存储管理/截图/PDF/多标签/批量任务",
+  "main": "lib/tabbit.js",
+  "bin": {
+    "tabbit": "./cli.js"
+  },
+  "scripts": {
+    "chat": "node cli.js chat",
+    "chat-i": "node cli.js chat -i",
+    "screenshot": "node cli.js screenshot",
+    "pdf": "node cli.js pdf",
+    "list": "node cli.js list",
+    "status": "node cli.js status",
+    "launch": "node cli.js launch",
+    "devices": "node cli.js devices",
+    "net-log": "node cli.js net log",
+    "net-cookies": "node cli.js net cookies",
+    "tabs": "node cli.js tabs"
+  },
+  "keywords": [
+    "tabbit",
+    "cdp",
+    "chrome-devtools-protocol",
+    "browser-automation",
+    "ai-chat",
+    "doubao"
+  ],
+  "dependencies": {
+    "ws": "^8.0.0"
+  }
+}
