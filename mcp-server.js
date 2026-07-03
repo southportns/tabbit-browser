@@ -1,23 +1,29 @@
 #!/usr/bin/env node
 /**
- * Tabbit Browser MCP Server v2.1
+ * Tabbit Browser MCP Server v2.3
  *
- * 工具列表 (15 个):
- *   核心:  tabbit_chat, tabbit_screenshot, tabbit_pdf, tabbit_status, tabbit_launch, tabbit_new
- *   设备:  tabbit_device
- *   网络:  tabbit_network, tabbit_storage
- *   输入:  tabbit_input
- *   标签:  tabbit_tabs
- *   增强:  tabbit_navigate, tabbit_extract, tabbit_antidetect, tabbit_cookies
+ * 工具列表 (21 个):
+ *   核心:    tabbit_chat, tabbit_screenshot, tabbit_pdf, tabbit_status, tabbit_launch, tabbit_new
+ *   设备:    tabbit_device
+ *   网络:    tabbit_network, tabbit_storage
+ *   输入:    tabbit_input, tabbit_element
+ *   标签:    tabbit_tabs
+ *   增强:    tabbit_navigate, tabbit_extract, tabbit_antidetect, tabbit_cookies, tabbit_console
+ *   特色:    tabbit_readability, tabbit_download, tabbit_monitor, tabbit_publish
  */
 
-const { TabbitClient, TabbitBrowser, DeviceManager } = require('./lib/tabbit');
+const { TabbitClient, TabbitBrowser, DeviceManager, httpGet } = require('./lib/tabbit');
 const { NetworkManager } = require('./lib/network');
 const { StorageManager } = require('./lib/storage');
 const { CaptureManager } = require('./lib/capture');
 const { InputManager } = require('./lib/input');
 const { MultiTabManager } = require('./lib/multi-tab');
 const { Scheduler } = require('./lib/scheduler');
+const { ElementManager } = require('./lib/element');
+const { ContentExtractor } = require('./lib/content');
+const { DownloadManager } = require('./lib/download');
+const { MonitorManager } = require('./lib/monitor');
+const { PLATFORMS } = require('./lib/publish');
 const fs = require('fs');
 const path = require('path');
 
@@ -77,6 +83,8 @@ class CDP {
     this.ws = null;
     this.msgId = 0;
     this.handlers = new Map();
+    this._eventHandlers = new Map();
+    this._closed = false;
   }
 
   async connect() {
@@ -91,18 +99,40 @@ class CDP {
         this.handlers.delete(msg.id);
         if (msg.error) reject(new Error(JSON.stringify(msg.error)));
         else resolve(msg.result);
+      } else if (msg.method && this._eventHandlers.has(msg.method)) {
+        for (const cb of this._eventHandlers.get(msg.method)) {
+          try { cb(msg.params); } catch (_) {}
+        }
       }
     });
+    this.ws.on('close', () => {
+      this._closed = true;
+      // 拒绝所有未决请求，避免 hang
+      for (const { reject, timer } of this.handlers.values()) {
+        clearTimeout(timer);
+        reject(new Error('CDP socket closed'));
+      }
+      this.handlers.clear();
+    });
+    this.ws.on('error', () => { /* close handler 会处理 */ });
     if (!this.isBrowser) await this.send('Runtime.enable');
     return this;
   }
 
+  on(event, cb) {
+    if (!this._eventHandlers.has(event)) this._eventHandlers.set(event, []);
+    this._eventHandlers.get(event).push(cb);
+  }
+
+  get isOpen() { return this.ws && this.ws.readyState === 1 && !this._closed; }
+
   send(method, params = {}) {
     return new Promise((resolve, reject) => {
+      if (!this.isOpen) return reject(new Error(`CDP socket not open: ${method}`));
       const id = ++this.msgId;
       const timer = setTimeout(() => { this.handlers.delete(id); reject(new Error(`CDP timeout: ${method}`)); }, CDP_TIMEOUT);
       this.handlers.set(id, { resolve, reject, timer });
-      this.ws.send(JSON.stringify({ id, method, params }));
+      this.ws.send(JSON.stringify({ id, method, params }), (err) => { if (err) reject(new Error(`WS send error: ${err.message}`)); });
     });
   }
 
@@ -115,8 +145,195 @@ class CDP {
     await this.send('Page.addScriptToEvaluateOnNewDocument', { source: ANTIDETECT_SCRIPT });
   }
 
-  close() { if (this.ws) this.ws.close(); }
+  close() { this._closed = true; if (this.ws) try { this.ws.close(); } catch (_) {} }
 }
+
+// ─── 持久化网络拦截器 ──────────────────────────────────────
+// 跨工具调用保持 CDP 会话，使 block/mock/throttle 真正生效，并累积请求日志。
+// 活动页面变化或会话断开时自动重连，并保留已注册的拦截规则。
+
+class NetworkInterceptor {
+  constructor(port) {
+    this.port = port;
+    this.cdp = null;          // 持久 CDP 会话
+    this.targetId = null;     // 当前附着的 target id
+    this.rules = [];          // [{pattern, type:'block'|'mock', response, status}]
+    this.requestLog = [];     // 累积请求日志（上限 500）
+    this._throttle = null;    // 当前限速设置
+  }
+
+  async _findActiveTarget() {
+    const list = await httpGet(`http://localhost:${this.port}/json/list`);
+    return list.find(t => t.type === 'page' && /^https?:\/\//.test(t.url))
+        || list.find(t => t.type === 'page')
+        || null;
+  }
+
+  /** 附着到指定 target（连接新 CDP 会话），用于 navigate 时让拦截器跟随新页面 */
+  async attachToTarget(target) {
+    if (this.cdp && this.targetId === target.id && this.cdp.isOpen) return this.cdp;
+    if (this.cdp) { try { this.cdp.close(); } catch (_) {} }
+    this.cdp = new CDP(target.webSocketDebuggerUrl);
+    await this.cdp.connect();
+    this.targetId = target.id;
+    await this.cdp.send('Network.enable');
+    await this.cdp.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+    this.cdp.on('Fetch.requestPaused', (p) => this._onPaused(p));
+    this.cdp.on('Network.requestWillBeSent', (p) => this._onRequest(p));
+    // 恢复限速设置
+    if (this._throttle) await this._applyThrottle(this._throttle);
+    return this.cdp;
+  }
+
+  /** 确保已附着到当前活跃页面；页面变化或断开时重连 */
+  async ensureAttached() {
+    const target = await this._findActiveTarget();
+    if (!target) throw new Error('无活跃页面可供附着网络拦截，请先打开一个网页');
+    return this.attachToTarget(target);
+  }
+
+  _onRequest(params) {
+    if (this.requestLog.length >= 500) this.requestLog.shift();
+    this.requestLog.push({
+      url: params.request.url,
+      method: params.request.method,
+      type: params.type,
+      time: new Date().toISOString(),
+    });
+  }
+
+  async _onPaused(params) {
+    const { requestId, request } = params;
+    const url = request.url;
+    for (const r of this.rules) {
+      if (url.includes(r.pattern)) {
+        try {
+          if (r.type === 'mock') {
+            const body = Buffer.from(typeof r.response === 'string' ? r.response : JSON.stringify(r.response || {})).toString('base64');
+            await this.cdp.send('Fetch.fulfillRequest', {
+              requestId,
+              responseCode: r.status || 200,
+              responseHeaders: [{ name: 'Content-Type', value: 'application/json; charset=utf-8' }],
+              body,
+            });
+            return;
+          }
+          if (r.type === 'block') {
+            await this.cdp.send('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' });
+            return;
+          }
+        } catch (_) { /* 已失效的 requestId 等，忽略 */ }
+      }
+    }
+    try { await this.cdp.send('Fetch.continueRequest', { requestId }); } catch (_) {}
+  }
+
+  async block(pattern) {
+    await this.ensureAttached();
+    this.rules = this.rules.filter(r => r.pattern !== pattern || r.type !== 'block');
+    this.rules.push({ pattern, type: 'block' });
+    return this.rules.length;
+  }
+
+  async mock(pattern, response, status = 200) {
+    await this.ensureAttached();
+    this.rules = this.rules.filter(r => r.pattern !== pattern || r.type !== 'mock');
+    this.rules.push({ pattern, type: 'mock', response, status });
+    return this.rules.length;
+  }
+
+  async unblock(pattern) {
+    if (pattern) this.rules = this.rules.filter(r => r.pattern !== pattern);
+    else this.rules = [];
+    return this.rules.length;
+  }
+
+  listRules() { return this.rules.map(r => ({ ...r, response: r.response ? '[已设置]' : undefined })); }
+
+  async _applyThrottle(mode) {
+    if (!mode) {
+      await this.cdp.send('Network.emulateNetworkConditions', {
+        offline: false, downloadThroughput: -1, uploadThroughput: -1, latency: 0,
+      });
+      return;
+    }
+    const presets = {
+      offline: { offline: true, downloadThroughput: 0, uploadThroughput: 0, latency: 0 },
+      'slow-3g': { offline: false, downloadThroughput: 50 * 1024 / 8, uploadThroughput: 50 * 1024 / 8, latency: 2000 },
+      'fast-3g': { offline: false, downloadThroughput: 1.5 * 1024 * 1024 / 8, uploadThroughput: 750 * 1024 / 8, latency: 562 },
+      '4g': { offline: false, downloadThroughput: 4 * 1024 * 1024 / 8, uploadThroughput: 3 * 1024 * 1024 / 8, latency: 100 },
+    };
+    await this.cdp.send('Network.emulateNetworkConditions', presets[mode] || presets['4g']);
+  }
+
+  async setThrottle(mode) {
+    await this.ensureAttached();
+    await this._applyThrottle(mode);
+    this._throttle = mode || null;
+  }
+
+  getLog(filter = {}) {
+    let log = [...this.requestLog];
+    if (filter.method) log = log.filter(r => r.method === filter.method);
+    if (filter.type) log = log.filter(r => r.type === filter.type);
+    if (filter.urlPattern) log = log.filter(r => r.url.includes(filter.urlPattern));
+    return log;
+  }
+
+  clearLog() { this.requestLog = []; }
+}
+
+const interceptor = new NetworkInterceptor(PORT);
+
+// ─── 持久化下载跟踪器 ──────────────────────────────────────
+// 跨调用保持下载记录。set-dir 时附着到活跃页面并设置下载目录，监听下载事件。
+
+class DownloadTracker {
+  constructor(port) {
+    this.port = port;
+    this.cdp = null;
+    this.targetId = null;
+    this.dir = path.join(process.env.HOME || process.env.USERPROFILE, 'Downloads', 'tabbit');
+    this.records = [];
+    this._mgr = new DownloadManager(null);
+  }
+
+  async _findActiveTarget() {
+    const list = await httpGet(`http://localhost:${this.port}/json/list`);
+    return list.find(t => t.type === 'page' && /^https?:\/\//.test(t.url))
+        || list.find(t => t.type === 'page')
+        || null;
+  }
+
+  async setDir(dir) {
+    this.dir = dir;
+    const target = await this._findActiveTarget();
+    if (!target) throw new Error('无活跃页面，请先打开一个网页');
+    if (this.cdp && this.cdp.isOpen && this.targetId === target.id) {
+      await this.cdp.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: dir });
+      return { dir, attached: true };
+    }
+    if (this.cdp) { try { this.cdp.close(); } catch (_) {} }
+    this.cdp = new CDP(target.webSocketDebuggerUrl);
+    await this.cdp.connect();
+    this.targetId = target.id;
+    await this.cdp.send('Page.enable');
+    await this.cdp.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: dir });
+    this._mgr.attachEvents(this.cdp, this.records);
+    return { dir, attached: true };
+  }
+
+  list(limit = 50) {
+    return this.records.slice(-limit);
+  }
+
+  clear() {
+    this.records = [];
+    return { cleared: true };
+  }
+}
+
+const downloadTracker = new DownloadTracker(PORT);
 
 // ─── 工具定义 ──────────────────────────────────────────────
 
@@ -175,7 +392,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['emulate', 'viewport', 'reset', 'dark', 'geo', 'touch', 'timezone'] },
-        device: { type: 'string', description: 'iphone-14, iphone-14-pro-max, ipad-pro, pixel-7, galaxy-s23, desktop-1080, desktop-1440' },
+        device: { type: 'string', description: 'iphone-14/14-pro-max, iphone-16/16-plus/16-pro/16-pro-max/16e, iphone-17/17-air/17-pro/17-pro-max, ipad-pro/ipad-pro-13, pixel-7/9, galaxy-s23/s24-ultra, desktop-1080/1440' },
         width: { type: 'number' }, height: { type: 'number' },
         enabled: { type: 'boolean' },
         latitude: { type: 'number' }, longitude: { type: 'number' },
@@ -187,15 +404,23 @@ const TOOLS = [
   // === 网络 ===
   {
     name: 'tabbit_network',
-    description: '网络管理（Cookie/拦截/Mock/限速）。',
+    description: '网络管理（Cookie/拦截/Mock/限速/请求日志）。block/mock/throttle/log 基于持久化拦截器，跨调用生效。',
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['cookies', 'export-cookies', 'import-cookies', 'block', 'mock', 'throttle', 'clear-cache', 'log'] },
-        pattern: { type: 'string' },
-        mockResponse: { type: 'object' },
-        mode: { type: 'string', description: 'offline, slow-3g, fast-3g, 4g' },
-        filePath: { type: 'string' },
+        action: {
+          type: 'string',
+          enum: ['cookies', 'export-cookies', 'import-cookies', 'block', 'mock', 'unblock', 'throttle', 'clear-cache', 'clear-rules', 'log', 'rules'],
+          description: '操作类型',
+        },
+        pattern: { type: 'string', description: 'URL 子串匹配模式 (block/mock/unblock/log 过滤)' },
+        mockResponse: { type: 'string', description: 'Mock 响应体 (mock 时使用，JSON 字符串或纯文本)' },
+        status: { type: 'number', description: 'Mock 响应状态码，默认 200' },
+        mode: { type: 'string', description: '限速模式: offline, slow-3g, fast-3g, 4g（传空字符串恢复）' },
+        filePath: { type: 'string', description: 'import-cookies 的文件路径' },
+        method: { type: 'string', description: 'log 按请求方法过滤 (GET/POST...)' },
+        type: { type: 'string', description: 'log 按资源类型过滤 (Document/XHR/Fetch/...)' },
+        limit: { type: 'number', description: 'log 最大返回条数，默认 50' },
       },
       required: ['action'],
     },
@@ -217,16 +442,16 @@ const TOOLS = [
   // === 输入 ===
   {
     name: 'tabbit_input',
-    description: '高级输入（点击/键盘/快捷键/滚动/拖拽）。',
+    description: '高级输入（点击/键盘/快捷键/滚动/拖拽/剪贴板）。',
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['click', 'type', 'key', 'hotkey', 'scroll', 'drag', 'select-all', 'copy', 'paste'] },
+        action: { type: 'string', enum: ['click', 'type', 'key', 'hotkey', 'scroll', 'drag', 'select-all', 'copy', 'paste', 'cut', 'undo', 'redo'] },
         x: { type: 'number' }, y: { type: 'number' },
         x2: { type: 'number' }, y2: { type: 'number' },
         text: { type: 'string' },
-        key: { type: 'string' },
-        hotkey: { type: 'string' },
+        key: { type: 'string', description: '按键名 (Enter/Tab/Escape/Backspace/Delete/ArrowUp/...)' },
+        hotkey: { type: 'string', description: '快捷键 (ctrl+c, ctrl+shift+t)' },
         direction: { type: 'string', enum: ['up', 'down'] },
       },
       required: ['action'],
@@ -235,13 +460,13 @@ const TOOLS = [
   // === 标签 ===
   {
     name: 'tabbit_tabs',
-    description: '多标签管理。',
+    description: '多标签管理。list 返回的 id 即 close 所需的 targetId。',
     inputSchema: {
       type: 'object',
       properties: {
         action: { type: 'string', enum: ['list', 'open', 'close'] },
         url: { type: 'string' },
-        targetId: { type: 'string' },
+        targetId: { type: 'string', description: '目标 id (来自 list 输出的完整 id)' },
       },
       required: ['action'],
     },
@@ -314,9 +539,106 @@ const TOOLS = [
         },
         limit: { type: 'number', description: '最大返回条数，默认 50' },
         search: { type: 'string', description: '按关键词搜索日志内容' },
-        includePreserved: { type: 'boolean', description: '是否包含历史导航的日志，默认 false' },
+        includePreserved: { type: 'boolean', description: '是否包含历史持久化日志（window.__tabbit_logs），默认 true' },
       },
       required: ['action'],
+    },
+  },
+  // === 智能元素操作 ===
+  {
+    name: 'tabbit_element',
+    description: '智能元素操作：按文本/placeholder/选择器定位元素，自动滚动到可见、等待出现、健壮点击与输入。是发布、录制等自动化的底座，比坐标点击更耐改版。locator 用 {selector|text|placeholder|tag|role,index}。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['click', 'click-any', 'type', 'type-any', 'wait', 'get-text', 'scroll-into-view', 'upload', 'count'], description: '操作类型' },
+        locator: {
+          type: 'object',
+          description: '定位条件，支持 selector/text/placeholder/tag/role/index',
+          properties: {
+            selector: { type: 'string' },
+            text: { type: 'string' },
+            placeholder: { type: 'string' },
+            tag: { type: 'string' },
+            role: { type: 'string' },
+            index: { type: 'number' },
+          },
+        },
+        locators: { type: 'array', description: 'click-any/type-any 的备选定位器数组', items: { type: 'object' } },
+        text: { type: 'string', description: 'type/type-any 时输入的文本' },
+        filePaths: { type: 'array', description: 'upload 时的文件绝对路径数组', items: { type: 'string' } },
+        timeout: { type: 'number', description: '等待超时 ms，默认 10000' },
+        clear: { type: 'boolean', description: 'type 时是否先清空，默认 false' },
+      },
+      required: ['action'],
+    },
+  },
+  // === 正文提取 ===
+  {
+    name: 'tabbit_readability',
+    description: '智能正文提取：注入 Readability 算法按文本密度提取主体、去广告导航，转为 Markdown。适合把网页文章转成干净文本。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: { type: 'string', description: '限定根容器 CSS 选择器（可选，默认全文）' },
+        maxLength: { type: 'number', description: 'markdown 最大长度，默认不限' },
+      },
+    },
+  },
+  // === 下载管理 ===
+  {
+    name: 'tabbit_download',
+    description: '下载管理：设置下载目录、查看下载记录。set-dir 后该页面的下载会自动记录。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['set-dir', 'list', 'clear'], description: '操作类型' },
+        dir: { type: 'string', description: 'set-dir 时的下载目录绝对路径' },
+        limit: { type: 'number', description: 'list 最大返回条数，默认 50' },
+      },
+      required: ['action'],
+    },
+  },
+  // === 页面监控 ===
+  {
+    name: 'tabbit_monitor',
+    description: '页面监控：对页面区域取快照、轮询检测变化、对比差异。适合监控价格/库存/帖子数据。watch 会阻塞至变化或超时。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['snapshot', 'watch', 'diff'], description: '操作类型' },
+        selector: { type: 'string', description: '监控区域的 CSS 选择器（默认全文）' },
+        baseline: { type: 'string', description: 'watch 时的基线文本（为空则记录当前为基线）' },
+        current: { type: 'string', description: 'diff 时的当前文本' },
+        timeout: { type: 'number', description: 'watch 超时 ms，默认 60000，上限 300000' },
+        interval: { type: 'number', description: 'watch 轮询间隔 ms，默认 2000' },
+      },
+      required: ['action'],
+    },
+  },
+  // === 平台发布 ===
+  {
+    name: 'tabbit_publish',
+    description: '多平台自动发布：小红书/抖音/微博/知乎/B站/微信公众号。用文本定位耐改版。需先在浏览器登录并用 tabbit_cookies 保存登录态。首次建议 dryRun=true。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        platform: { type: 'string', enum: ['xhs', 'douyin', 'weibo', 'zhihu', 'bilibili', 'wechat'], description: '平台' },
+        content: {
+          type: 'object',
+          description: '发布内容',
+          properties: {
+            title: { type: 'string' },
+            text: { type: 'string' },
+            images: { type: 'array', items: { type: 'string' }, description: '图片绝对路径数组' },
+            video: { type: 'string', description: '视频绝对路径' },
+            topics: { type: 'array', items: { type: 'string' }, description: '话题数组' },
+          },
+        },
+        dryRun: { type: 'boolean', description: '只填表不点发布，默认 false' },
+        waitForLoad: { type: 'number', description: '导航后等待 ms，默认 5000' },
+      },
+      required: ['platform', 'content'],
     },
   },
 ];
@@ -384,38 +706,104 @@ async function executeTool(name, args) {
           case 'reset': await device.resetViewport(); session.close(); return { content: [{ type: 'text', text: '已恢复' }] };
           case 'dark': await device.setDarkMode(args.enabled !== false); session.close(); return { content: [{ type: 'text', text: `深色: ${args.enabled !== false}` }] };
           case 'geo': await device.setGeolocation(args.latitude, args.longitude); session.close(); return { content: [{ type: 'text', text: `${args.latitude}, ${args.longitude}` }] };
+          case 'touch': await device.enableTouchEmulation(args.enabled !== false); session.close(); return { content: [{ type: 'text', text: `触摸仿真: ${args.enabled !== false}` }] };
+          case 'timezone': await device.setTimezone(args.timezone); session.close(); return { content: [{ type: 'text', text: `时区: ${args.timezone}` }] };
           default: session.close(); throw new Error(`未知操作: ${args.action}`);
         }
       }
 
       // === 网络 ===
       case 'tabbit_network': {
-        const target = await findPage(client);
-        const session = await client.connectTo(target);
-        const net = new NetworkManager(session);
-        await net.enable();
         switch (args.action) {
-          case 'cookies': { const c = await net.getCookies([target.url]); session.close(); return { content: [{ type: 'text', text: c.map(x => `${x.name}=${x.value.substring(0, 20)}... (${x.domain})`).join('\n') }], cookies: c }; }
-          case 'export-cookies': { const j = await net.exportCookies([target.url]); session.close(); return { content: [{ type: 'text', text: j }], cookies: JSON.parse(j) }; }
-          case 'throttle': await net.emulateNetwork(args.mode || null); session.close(); return { content: [{ type: 'text', text: args.mode ? `限速: ${args.mode}` : '恢复' }] };
-          case 'clear-cache': await net.clearCache(); session.close(); return { content: [{ type: 'text', text: '已清除' }] };
-          case 'block': net.block(args.pattern); session.close(); return { content: [{ type: 'text', text: `屏蔽: ${args.pattern}` }] };
-          case 'mock': net.mock(args.pattern, args.mockResponse); session.close(); return { content: [{ type: 'text', text: `Mock: ${args.pattern}` }] };
-          default: session.close(); throw new Error(`未知操作: ${args.action}`);
+          // 持久化拦截器相关：block/mock/unblock/throttle/log/rules/clear-rules
+          case 'block': {
+            if (!args.pattern) throw new Error('block 需要 pattern 参数');
+            const n = await interceptor.block(args.pattern);
+            return { content: [{ type: 'text', text: `已屏蔽匹配 "${args.pattern}" 的请求（当前共 ${n} 条规则）` }] };
+          }
+          case 'mock': {
+            if (!args.pattern) throw new Error('mock 需要 pattern 参数');
+            const resp = args.mockResponse !== undefined ? args.mockResponse : '';
+            const n = await interceptor.mock(args.pattern, resp, args.status || 200);
+            return { content: [{ type: 'text', text: `已 Mock 匹配 "${args.pattern}" 的请求 → 状态 ${args.status || 200}（当前共 ${n} 条规则）` }] };
+          }
+          case 'unblock': {
+            const n = await interceptor.unblock(args.pattern);
+            return { content: [{ type: 'text', text: args.pattern ? `已移除 "${args.pattern}" 的规则` : `已清空所有拦截规则` }] };
+          }
+          case 'clear-rules': {
+            await interceptor.unblock(null);
+            return { content: [{ type: 'text', text: '已清空所有拦截规则' }] };
+          }
+          case 'rules': {
+            const rules = interceptor.listRules();
+            return { content: [{ type: 'text', text: rules.length ? rules.map(r => `[${r.type}] ${r.pattern}${r.response ? ' → mock' : ''}`).join('\n') : '(无规则)' }], rules };
+          }
+          case 'throttle': {
+            await interceptor.setThrottle(args.mode || null);
+            return { content: [{ type: 'text', text: args.mode ? `限速: ${args.mode}` : '已恢复默认网络' }] };
+          }
+          case 'log': {
+            const log = interceptor.getLog({ method: args.method, type: args.type, urlPattern: args.pattern });
+            const limit = args.limit || 50;
+            const slice = log.slice(-limit);
+            const text = slice.length
+              ? slice.map(r => `[${r.time}] ${r.method} ${r.type || ''} ${r.url.substring(0, 120)}`).join('\n')
+              : '(暂无请求日志；拦截器未附着或尚无请求。调用 block/mock/throttle 后会自动附着并开始记录。)';
+            return { content: [{ type: 'text', text: `${text}\n共 ${log.length} 条` }], log: slice };
+          }
+          // 一次性会话操作：Cookie/缓存
+          default: {
+            const target = await findPage(client);
+            const session = await client.connectTo(target);
+            const net = new NetworkManager(session);
+            await net.enableNetworkOnly();
+            try {
+              switch (args.action) {
+                case 'cookies': { const c = await net.getCookies([target.url]); return { content: [{ type: 'text', text: c.map(x => `${x.name}=${x.value.substring(0, 20)}... (${x.domain})`).join('\n') || '(无)' }], cookies: c }; }
+                case 'export-cookies': { const j = await net.exportCookies([target.url]); return { content: [{ type: 'text', text: j }], cookies: JSON.parse(j) }; }
+                case 'clear-cache': await net.clearCache(); return { content: [{ type: 'text', text: '浏览器缓存已清除' }] };
+                case 'import-cookies': {
+                  if (!args.filePath) throw new Error('import-cookies 需要 filePath 参数');
+                  const cookies = JSON.parse(fs.readFileSync(args.filePath, 'utf-8'));
+                  const n = await net.importCookies(cookies);
+                  return { content: [{ type: 'text', text: `导入 ${n} cookies` }] };
+                }
+                default: throw new Error(`未知操作: ${args.action}`);
+              }
+            } finally {
+              session.close();
+            }
+          }
         }
       }
 
       // === 存储 ===
       case 'tabbit_storage': {
-        const target = await findPage(client);
+        // storage 操作需连接到与 origin 匹配的 http(s) 页面，否则 DOMStorage 报 Frame not found
+        const targets = await client.getTargets();
+        let origin = args.origin;
+        // 未指定 origin 时，取第一个 http(s) 页面的 origin 作为默认
+        if (!origin) {
+          const httpPage = targets.find(t => (t.type === 'page' || t.type === 'webview') && /^https?:\/\//.test(t.url));
+          if (!httpPage) throw new Error('未找到可操作的 http(s) 页面，请先打开目标网站或传入 origin');
+          try { origin = new URL(httpPage.url).origin; } catch { origin = httpPage.url; }
+        } else {
+          // 传入的 origin 规范化（去掉路径）
+          try { origin = new URL(origin).origin; } catch {}
+        }
+        // 找到该 origin 下的页面 target（优先 page，其次 webview）
+        const target = targets.find(t => t.type === 'page' && t.url.startsWith(origin))
+          || targets.find(t => t.type === 'webview' && t.url.startsWith(origin))
+          || targets.find(t => /^https?:\/\//.test(t.url) && t.url.startsWith(origin));
+        if (!target) throw new Error(`未找到 origin 为 ${origin} 的页面，请先在浏览器中打开该站点`);
         const session = await client.connectTo(target);
         const storage = new StorageManager(session);
-        const origin = args.origin || target.url;
         switch (args.action) {
           case 'export': { const s = await storage.exportLoginState(origin); const fp = args.filePath || 'login-state.json'; fs.writeFileSync(fp, JSON.stringify(s, null, 2)); session.close(); return { content: [{ type: 'text', text: `导出 ${s.cookies.length} cookies → ${fp}` }], state: s }; }
           case 'import': { const s = JSON.parse(fs.readFileSync(args.filePath, 'utf-8')); const r = await storage.importLoginState(s); session.close(); return { content: [{ type: 'text', text: `导入 ${r.cookiesImported} cookies` }] }; }
           case 'clear': await storage.clearAll(origin); session.close(); return { content: [{ type: 'text', text: `已清除 ${origin}` }] };
-          case 'local': { const items = await storage.getLocalStorage(origin); session.close(); return { content: [{ type: 'text', text: items.map(e => `${e.key}=${e.value.substring(0, 30)}`).join('\n') || '(空)' }], items }; }
+          case 'local': { const items = await storage.getLocalStorage(origin); session.close(); return { content: [{ type: 'text', text: items.map(e => `${e.key}=${String(e.value).substring(0, 30)}`).join('\n') || '(空)' }], items }; }
           default: session.close(); throw new Error(`未知操作: ${args.action}`);
         }
       }
@@ -431,6 +819,13 @@ async function executeTool(name, args) {
           case 'key': await input.pressKey(args.key); session.close(); return { content: [{ type: 'text', text: `按键: ${args.key}` }] };
           case 'hotkey': await input.pressShortcut(args.hotkey); session.close(); return { content: [{ type: 'text', text: `快捷键: ${args.hotkey}` }] };
           case 'scroll': if (args.direction === 'up') await input.scrollUp(400, 400); else await input.scrollDown(400, 400); session.close(); return { content: [{ type: 'text', text: `滚动: ${args.direction || 'down'}` }] };
+          case 'drag': await input.drag(args.x, args.y, args.x2, args.y2); session.close(); return { content: [{ type: 'text', text: `拖拽 ${args.x},${args.y} → ${args.x2},${args.y2}` }] };
+          case 'select-all': await input.selectAll(); session.close(); return { content: [{ type: 'text', text: '全选' }] };
+          case 'copy': await input.copy(); session.close(); return { content: [{ type: 'text', text: '复制' }] };
+          case 'paste': await input.paste(); session.close(); return { content: [{ type: 'text', text: '粘贴' }] };
+          case 'cut': await input.cut(); session.close(); return { content: [{ type: 'text', text: '剪切' }] };
+          case 'undo': await input.undo(); session.close(); return { content: [{ type: 'text', text: '撤销' }] };
+          case 'redo': await input.redo(); session.close(); return { content: [{ type: 'text', text: '重做' }] };
           default: session.close(); throw new Error(`未知操作: ${args.action}`);
         }
       }
@@ -439,9 +834,13 @@ async function executeTool(name, args) {
       case 'tabbit_tabs': {
         const mt = new MultiTabManager({ port: PORT });
         switch (args.action) {
-          case 'list': { const t = await client.getTargets(); const p = t.filter(x => x.type === 'page'); await mt.closeAll(); return { content: [{ type: 'text', text: p.map(x => `${x.id.substring(0, 10)} ${x.title} ${x.url}`).join('\n') }], tabs: p }; }
-          case 'open': { const id = await mt.createTab(args.url || 'https://web.tabbit.com/newtab'); await mt.closeAll(); return { content: [{ type: 'text', text: `新标签: ${id}` }], targetId: id }; }
-          case 'close': await mt.closeTab(args.targetId); await mt.closeAll(); return { content: [{ type: 'text', text: `已关闭` }] };
+          case 'list': { const t = await client.getTargets(); const p = t.filter(x => x.type === 'page'); await mt.closeAll(); return { content: [{ type: 'text', text: p.map(x => `${x.id}  ${x.title}  ${x.url}`).join('\n') || '(无标签页)' }], tabs: p.map(x => ({ id: x.id, title: x.title, url: x.url })) }; }
+          case 'open': { const id = await mt.createTab(args.url || 'https://web.tabbit.com/newtab'); await mt.closeAll(); return { content: [{ type: 'text', text: `新标签已打开: ${id}` }], targetId: id }; }
+          case 'close': {
+            if (!args.targetId) throw new Error('close 需要 targetId 参数（来自 list 输出的 id）');
+            await mt.closeTab(args.targetId); await mt.closeAll();
+            return { content: [{ type: 'text', text: `已关闭: ${args.targetId}` }] };
+          }
           default: await mt.closeAll(); throw new Error(`未知操作`);
         }
       }
@@ -451,18 +850,33 @@ async function executeTool(name, args) {
         const version = await client.getVersion();
         const bws = new CDP(version.webSocketDebuggerUrl, true);
         await bws.connect();
-        await bws.send('Target.createTarget', { url: args.url });
-        await sleep(2000);
+        // 先以 about:blank 创建目标，便于在真实导航前注入反检测脚本
+        const { targetId } = await bws.send('Target.createTarget', { url: 'about:blank' });
         bws.close();
 
-        const targets = await client.getTargets();
-        const hostname = new URL(args.url).hostname;
-        const page = targets.find(t => t.type === 'page' && t.url.includes(hostname));
-        if (!page) throw new Error('页面未找到');
+        // 等待新 target 出现在 /json/list
+        let page = null;
+        const targetUrl = args.url;
+        for (let i = 0; i < 20; i++) {
+          const targets = await client.getTargets();
+          page = targets.find(t => (t.id === targetId || t.targetId === targetId));
+          if (page) break;
+          await sleep(200);
+        }
+        if (!page) throw new Error('新标签页创建失败');
 
         const cdp = new CDP(page.webSocketDebuggerUrl);
         await cdp.connect();
+        // 关键：在导航前注入反检测脚本，使其在首屏加载即生效
+        await cdp.send('Page.enable');
         await cdp.injectAntiDetect();
+
+        // 让持久化拦截器跟随新页面：使 block/mock 规则、限速、请求日志
+        // 在首屏加载即生效。失败不阻断导航（如无规则也无需附着）。
+        try { await interceptor.attachToTarget(page); } catch (_) {}
+
+        // 导航到真实 URL
+        await cdp.send('Page.navigate', { url: targetUrl });
 
         const waitTime = args.waitForLoad || 3000;
         await sleep(waitTime);
@@ -511,7 +925,7 @@ async function executeTool(name, args) {
             break;
           case 'custom':
             if (!args.selector) throw new Error('custom 类型需要 selector 参数');
-            extractScript = `JSON.stringify([...document.querySelectorAll('${args.selector}')].slice(0,${limit}).map(e => ({tag: e.tagName, text: e.textContent?.trim().substring(0,100), cls: (e.className||'').substring(0,50)})))`;
+            extractScript = `JSON.stringify([...document.querySelectorAll(${JSON.stringify(args.selector)})].slice(0,${limit}).map(e => ({tag: e.tagName, text: e.textContent?.trim().substring(0,100), cls: (e.className||'').substring(0,50)})))`;
             break;
           default:
             throw new Error(`未知提取类型: ${args.type}`);
@@ -549,7 +963,7 @@ async function executeTool(name, args) {
             const target = await findPage(client);
             const session = await client.connectTo(target);
             const net = new NetworkManager(session);
-            await net.enable();
+            await net.enableNetworkOnly();
             const cookies = await net.getCookies([target.url]);
             const filePath = path.join(COOKIES_DIR, `${args.site || 'default'}.json`);
             fs.writeFileSync(filePath, JSON.stringify(cookies, null, 2));
@@ -562,7 +976,7 @@ async function executeTool(name, args) {
             const target = await findPage(client);
             const session = await client.connectTo(target);
             const net = new NetworkManager(session);
-            await net.enable();
+            await net.enableNetworkOnly();
             const cookies = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
             await net.importCookies(cookies);
             session.close();
@@ -585,7 +999,7 @@ async function executeTool(name, args) {
               try {
                 const session = await client.connectTo(p);
                 const net = new NetworkManager(session);
-                await net.enable();
+                await net.enableNetworkOnly();
                 const cookies = await net.getCookies([p.url]);
                 if (cookies.length > 0) {
                   const site = new URL(p.url).hostname.replace(/\./g, '_');
@@ -610,7 +1024,7 @@ async function executeTool(name, args) {
                 for (const p of pages) {
                   const session = await client.connectTo(p);
                   const net = new NetworkManager(session);
-                  await net.enable();
+                  await net.enableNetworkOnly();
                   await net.importCookies(cookies);
                   session.close();
                 }
@@ -628,8 +1042,7 @@ async function executeTool(name, args) {
         const target = await findPage(client);
         const session = await client.connectTo(target);
 
-        // 启用 Console 域
-        await session.send('Console.enable');
+        await session.send('Runtime.enable');
         await session.send('Log.enable');
 
         switch (args.action) {
@@ -637,7 +1050,6 @@ async function executeTool(name, args) {
           case 'errors':
           case 'warnings':
           case 'logs': {
-            // 确定过滤类型
             let filterType = args.type;
             if (args.action === 'errors') filterType = 'error';
             else if (args.action === 'warnings') filterType = 'warning';
@@ -645,105 +1057,87 @@ async function executeTool(name, args) {
 
             const limit = args.limit || 50;
             const search = args.search || '';
-            const includePreserved = args.includePreserved || false;
 
-            // 通过 JS 获取控制台日志（需要先注入日志捕获器）
-            const result = await session.send('Runtime.evaluate', {
-              expression: `(() => {
-                // 从 window.__tabbit_logs 获取已捕获的日志
-                const logs = window.__tabbit_logs || [];
-                let filtered = logs;
-
-                // 按类型过滤
-                if (${filterType ? `'${filterType}'` : 'null'}) {
-                  filtered = filtered.filter(l => l.type === '${filterType || ''}');
-                }
-
-                // 按关键词搜索
-                if (${search ? `'${search}'` : 'null'}) {
-                  const keyword = '${search || ''}'.toLowerCase();
-                  filtered = filtered.filter(l => l.text.toLowerCase().includes(keyword));
-                }
-
-                return JSON.stringify(filtered.slice(-${limit}));
-              })()`,
-              returnByValue: true,
+            // ── 1. 即时事件捕获：本次 session 期间触发的 console 输出 ──
+            // Runtime.consoleAPICalled 无需提前注入，任何 console 调用都能抓到
+            const liveLogs = [];
+            session.on('Runtime.consoleAPICalled', (params) => {
+              const text = (params.args || [])
+                .map(a => a.value !== undefined ? String(a.value) : (a.description || a.type || '[object]'))
+                .join(' ');
+              liveLogs.push({ type: params.type, text, time: params.timestamp || Date.now() });
+            });
+            // Log.entryAdded 捕获浏览器级日志（未捕获异常、网络错误等）
+            session.on('Log.entryAdded', (entry) => {
+              const e = entry.entry || entry;
+              liveLogs.push({
+                type: e.level === 'error' ? 'error' : (e.level === 'warning' ? 'warning' : 'log'),
+                text: (e.text || '') + (e.url ? ` (${e.url}:${e.lineNumber || 0})` : ''),
+                time: e.timestamp || Date.now(),
+              });
             });
 
-            let logs = [];
-            try { logs = JSON.parse(result.result?.value || '[]'); } catch {}
+            // ── 2. 持久 hook：捕获历史/页面加载阶段日志，跨调用持久 ──
+            // 用 addScriptToEvaluateOnNewDocument 在文档最早期注入，跨导航生效
+            await session.send('Page.enable');
+            const hookSrc = `
+              if (!window.__tabbit_logs) {
+                window.__tabbit_logs = [];
+                const mk = (type) => function() {
+                  window.__tabbit_logs.push({type, text:[...arguments].map(a=>{try{return typeof a==='object'?JSON.stringify(a):String(a)}catch(e){return String(a)}}).join(' '), time:Date.now()});
+                };
+                ['log','warn','error','info','debug'].forEach(m => {
+                  const t = m === 'warn' ? 'warning' : m;
+                  const orig = console[m];
+                  console[m] = function(){ mk(t).apply(null, arguments); orig.apply(console, arguments); };
+                });
+                window.addEventListener('error', (e) => {
+                  window.__tabbit_logs.push({type:'error', text:'[Uncaught] ' + e.message + ' at ' + (e.filename||'') + ':' + (e.lineno||0), time:Date.now()});
+                });
+                window.addEventListener('unhandledrejection', (e) => {
+                  window.__tabbit_logs.push({type:'error', text:'[UnhandledRejection] ' + (e.reason && e.reason.message ? e.reason.message : e.reason), time:Date.now()});
+                });
+              }
+            `;
+            try { await session.send('Page.addScriptToEvaluateOnNewDocument', { source: hookSrc }); } catch {}
+            // 对当前已加载文档立即注入一次（addScriptToEvaluateOnNewDocument 只对新文档生效）
+            await session.send('Runtime.evaluate', { expression: hookSrc, returnByValue: true });
 
-            // 如果没有捕获到日志，尝试通过 LogDomain 获取
-            if (logs.length === 0) {
-              // 注入日志捕获器并重新获取
-              await session.send('Runtime.evaluate', {
-                expression: `
-                  if (!window.__tabbit_logs) {
-                    window.__tabbit_logs = [];
-                    const origLog = console.log;
-                    const origWarn = console.warn;
-                    const origError = console.error;
-                    const origInfo = console.info;
-                    const origDebug = console.debug;
-
-                    console.log = function() {
-                      window.__tabbit_logs.push({type:'log', text:[...arguments].map(a=>typeof a==='object'?JSON.stringify(a):String(a)).join(' '), time:Date.now()});
-                      origLog.apply(console, arguments);
-                    };
-                    console.warn = function() {
-                      window.__tabbit_logs.push({type:'warning', text:[...arguments].map(a=>typeof a==='object'?JSON.stringify(a):String(a)).join(' '), time:Date.now()});
-                      origWarn.apply(console, arguments);
-                    };
-                    console.error = function() {
-                      window.__tabbit_logs.push({type:'error', text:[...arguments].map(a=>typeof a==='object'?JSON.stringify(a):String(a)).join(' '), time:Date.now()});
-                      origError.apply(console, arguments);
-                    };
-                    console.info = function() {
-                      window.__tabbit_logs.push({type:'info', text:[...arguments].map(a=>typeof a==='object'?JSON.stringify(a):String(a)).join(' '), time:Date.now()});
-                      origInfo.apply(console, arguments);
-                    };
-                    console.debug = function() {
-                      window.__tabbit_logs.push({type:'debug', text:[...arguments].map(a=>typeof a==='object'?JSON.stringify(a):String(a)).join(' '), time:Date.now()});
-                      origDebug.apply(console, arguments);
-                    };
-
-                    // 捕获未处理错误
-                    window.addEventListener('error', (e) => {
-                      window.__tabbit_logs.push({type:'error', text:'[Uncaught] ' + e.message + ' at ' + e.filename + ':' + e.lineno, time:Date.now()});
-                    });
-                    window.addEventListener('unhandledrejection', (e) => {
-                      window.__tabbit_logs.push({type:'error', text:'[UnhandledRejection] ' + (e.reason?.message || e.reason || 'unknown'), time:Date.now()});
-                    });
-                  }
-                `,
-                returnByValue: true,
-              });
-
-              // 获取页面已有的错误（通过 Runtime.evaluate 获取）
-              const existingErrors = await session.send('Runtime.evaluate', {
-                expression: `JSON.stringify(window.__tabbit_logs || [])`,
-                returnByValue: true,
-              });
-              try { logs = JSON.parse(existingErrors.result?.value || '[]'); } catch {}
+            // ── 3. 读取历史持久日志（includePreserved 默认 true）──
+            let preservedLogs = [];
+            if (args.includePreserved !== false) {
+              try {
+                const r = await session.send('Runtime.evaluate', {
+                  expression: `JSON.stringify(window.__tabbit_logs || [])`,
+                  returnByValue: true,
+                });
+                preservedLogs = JSON.parse(r.result?.value || '[]');
+              } catch {}
             }
 
-            // 格式化输出
-            if (logs.length === 0) {
-              session.close();
-              return { content: [{ type: 'text', text: '(无控制台日志)\n注意: 日志捕获器已注入，后续的 console 输出将被记录。' }] };
+            // ── 4. 合并去重（持久 + 即时）──
+            const seen = new Set(preservedLogs.map(l => l.time + '|' + l.type + '|' + l.text));
+            for (const l of liveLogs) {
+              const k = l.time + '|' + l.type + '|' + l.text;
+              if (!seen.has(k)) { preservedLogs.push(l); seen.add(k); }
             }
 
-            // 过滤
+            let logs = preservedLogs;
             if (filterType) logs = logs.filter(l => l.type === filterType);
             if (search) {
               const keyword = search.toLowerCase();
-              logs = logs.filter(l => l.text.toLowerCase().includes(keyword));
+              logs = logs.filter(l => String(l.text).toLowerCase().includes(keyword));
+            }
+
+            if (logs.length === 0) {
+              session.close();
+              return { content: [{ type: 'text', text: '(无控制台日志)\n日志捕获器已就绪：历史日志记录到 window.__tabbit_logs，本次会话期间的 console 输出也会实时捕获。' }] };
             }
 
             const output = logs.slice(-limit).map(l => {
               const time = new Date(l.time).toLocaleTimeString();
               const icon = { log: '📝', info: 'ℹ️', warning: '⚠️', error: '❌', debug: '🔍' }[l.type] || '📝';
-              return `[${time}] ${icon} ${l.type}: ${l.text.substring(0, 200)}`;
+              return `[${time}] ${icon} ${l.type}: ${String(l.text).substring(0, 200)}`;
             }).join('\n');
 
             session.close();
@@ -763,6 +1157,187 @@ async function executeTool(name, args) {
             session.close();
             throw new Error(`未知操作: ${args.action}`);
         }
+      }
+
+      // === 智能元素操作 ===
+      case 'tabbit_element': {
+        const target = await findPage(client);
+        const session = await client.connectTo(target);
+        const element = new ElementManager(session);
+        try {
+          switch (args.action) {
+            case 'click': {
+              if (!args.locator) throw new Error('需要 locator 参数');
+              const r = await element.click(args.locator, { timeout: args.timeout });
+              return { content: [{ type: 'text', text: `已点击: ${JSON.stringify(args.locator)} @ ${Math.round(r.x)},${Math.round(r.y)}` }] };
+            }
+            case 'click-any': {
+              if (!args.locators || !args.locators.length) throw new Error('需要 locators 数组');
+              const r = await element.clickAny(args.locators, { timeout: args.timeout });
+              return { content: [{ type: 'text', text: `已点击 @ ${Math.round(r.x)},${Math.round(r.y)}` }] };
+            }
+            case 'type': {
+              if (!args.locator) throw new Error('需要 locator 参数');
+              await element.type(args.locator, args.text || '', { clear: args.clear, timeout: args.timeout });
+              return { content: [{ type: 'text', text: `已输入 ${args.text?.length || 0} 字符` }] };
+            }
+            case 'type-any': {
+              if (!args.locators || !args.locators.length) throw new Error('需要 locators 数组');
+              await element.typeAny(args.locators, args.text || '', { clear: args.clear, timeout: args.timeout });
+              return { content: [{ type: 'text', text: `已输入 ${args.text?.length || 0} 字符` }] };
+            }
+            case 'wait': {
+              if (!args.locator) throw new Error('需要 locator 参数');
+              const el = await element.waitFor(args.locator, { timeout: args.timeout || 10000 });
+              return { content: [{ type: 'text', text: `元素已出现: ${el.tag} "${el.text.substring(0, 40)}"` }] };
+            }
+            case 'get-text': {
+              const t = await element.getText(args.locator || {});
+              return { content: [{ type: 'text', text: t || '(空)' }] };
+            }
+            case 'scroll-into-view': {
+              const el = await element.scrollIntoView(args.locator || {});
+              return { content: [{ type: 'text', text: `已滚动到: ${el.tag} @ ${Math.round(el.cx)},${Math.round(el.cy)}` }] };
+            }
+            case 'upload': {
+              if (!args.filePaths || !args.filePaths.length) throw new Error('需要 filePaths 数组');
+              const r = await element.upload(args.filePaths, args.locator || {});
+              return { content: [{ type: 'text', text: `已上传 ${r.uploaded} 个文件` }] };
+            }
+            case 'count': {
+              const n = await element.count(args.locator || {});
+              return { content: [{ type: 'text', text: `匹配 ${n} 个元素` }], count: n };
+            }
+            default: throw new Error(`未知操作: ${args.action}`);
+          }
+        } finally {
+          session.close();
+        }
+      }
+
+      // === 正文提取 ===
+      case 'tabbit_readability': {
+        const target = await findPage(client);
+        const session = await client.connectTo(target);
+        const ext = new ContentExtractor(session);
+        try {
+          const data = await ext.extract({ selector: args.selector, maxLength: args.maxLength });
+          return { content: [{ type: 'text', text: `# ${data.title}\n\n${data.markdown}\n\n---\n长度: ${data.length} 字符` }], ...data };
+        } finally {
+          session.close();
+        }
+      }
+
+      // === 下载管理 ===
+      case 'tabbit_download': {
+        switch (args.action) {
+          case 'set-dir': {
+            const dir = args.dir || downloadTracker.dir;
+            const r = await downloadTracker.setDir(dir);
+            return { content: [{ type: 'text', text: `下载目录已设为 ${r.dir}，已附着到当前页面` }], dir: r.dir };
+          }
+          case 'list': {
+            const records = downloadTracker.list(args.limit || 50);
+            const text = records.length
+              ? records.map(r => `[${r.time}] ${r.filename} ${r.state} ${r.received || 0}/${r.total || 0}`).join('\n')
+              : '(暂无下载记录。先 set-dir 附着到页面后再触发下载。)';
+            return { content: [{ type: 'text', text: `${text}\n共 ${records.length} 条` }], records };
+          }
+          case 'clear': {
+            downloadTracker.clear();
+            return { content: [{ type: 'text', text: '下载记录已清空' }] };
+          }
+          default: throw new Error(`未知操作: ${args.action}`);
+        }
+      }
+
+      // === 页面监控 ===
+      case 'tabbit_monitor': {
+        const target = await findPage(client);
+        const session = await client.connectTo(target);
+        const mon = new MonitorManager(session);
+        const locator = args.selector ? { selector: args.selector } : {};
+        try {
+          switch (args.action) {
+            case 'snapshot': {
+              const snap = await mon.snapshot(locator);
+              return { content: [{ type: 'text', text: `[${new Date(snap.time).toLocaleTimeString()}] 快照 (${snap.text.length} 字符):\n${snap.text.substring(0, 1000)}` }], snapshot: snap };
+            }
+            case 'watch': {
+              const r = await mon.watch(locator, { baseline: args.baseline, timeout: args.timeout, interval: args.interval });
+              const text = r.changed
+                ? `✅ 检测到变化（耗时 ${r.durationMs}ms）\n新增: ${r.diff.addedCount} 行\n移除: ${r.diff.removedCount} 行\n---\n${r.snapshot.text.substring(0, 1000)}`
+                : `⏱ ${r.note || '未变化'}（耗时 ${r.durationMs}ms）\n基线已记录，可将其作为 baseline 参数再次 watch 检测后续变化`;
+              return { content: [{ type: 'text', text }], ...r };
+            }
+            case 'diff': {
+              if (!args.baseline || !args.current) throw new Error('diff 需要 baseline 和 current 参数');
+              const d = mon.diff(args.baseline, args.current);
+              return { content: [{ type: 'text', text: `新增 ${d.addedCount} 行，移除 ${d.removedCount} 行\n--- 新增 ---\n${d.added.join('\n')}\n--- 移除 ---\n${d.removed.join('\n')}` }], diff: d };
+            }
+            default: throw new Error(`未知操作: ${args.action}`);
+          }
+        } finally {
+          session.close();
+        }
+      }
+
+      // === 平台发布 ===
+      case 'tabbit_publish': {
+        const platform = PLATFORMS[args.platform];
+        if (!platform) throw new Error(`未知平台: ${args.platform}`);
+        const content = args.content || {};
+        const dryRun = args.dryRun === true;
+
+        // 1. 创建新标签 → 注入反检测 → 导航到创作者中心
+        const version = await client.getVersion();
+        const bws = new CDP(version.webSocketDebuggerUrl, true);
+        await bws.connect();
+        const { targetId } = await bws.send('Target.createTarget', { url: 'about:blank' });
+        bws.close();
+
+        let page = null;
+        for (let i = 0; i < 20; i++) {
+          const targets = await client.getTargets();
+          page = targets.find(t => t.id === targetId || t.targetId === targetId);
+          if (page) break;
+          await sleep(200);
+        }
+        if (!page) throw new Error('发布标签页创建失败');
+
+        const cdp = new CDP(page.webSocketDebuggerUrl);
+        await cdp.connect();
+        await cdp.send('Page.enable');
+        await cdp.injectAntiDetect();
+        try { await interceptor.attachToTarget(page); } catch (_) {}
+        await cdp.send('Page.navigate', { url: platform.creatorUrl });
+        await sleep(args.waitForLoad || 5000);
+
+        const finalUrl = await cdp.eval('location.href');
+        const title = await cdp.eval('document.title');
+
+        // 2. 登录态检查
+        const notLoggedIn = platform.loginPattern && finalUrl.includes(platform.loginPattern);
+        if (notLoggedIn) {
+          cdp.close();
+          return {
+            content: [{ type: 'text', text: `⚠️ 未登录${platform.name}。\n当前 URL: ${finalUrl}\n请先在浏览器登录${platform.name}，并用 tabbit_cookies save 保存登录态，然后重试。\n发布流程已终止。` }],
+            success: false, warning: 'not_logged_in', url: finalUrl, platform: args.platform,
+          };
+        }
+
+        // 3. 用 ElementManager 执行平台发布流程
+        const element = new ElementManager(cdp);
+        const log = [];
+        const result = await platform.publish({ element, content, dryRun, log });
+        cdp.close();
+
+        const text = `【${platform.name}】${dryRun ? '(dryRun) ' : ''}${result.success ? '✅ 已发起发布' : '⚠️ ' + (result.warning || '未发布')}\nURL: ${finalUrl}\n标题: ${title}\n步骤:\n${(result.steps || []).map(s => '  - ' + s).join('\n')}`;
+        return {
+          content: [{ type: 'text', text }],
+          platform: args.platform, success: !!result.success,
+          warning: result.warning, steps: result.steps, url: finalUrl,
+        };
       }
 
       default:
@@ -845,7 +1420,7 @@ async function handleMessage(msg) {
       sendResponse(id, {
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'tabbit-browser', version: '2.1.0' },
+        serverInfo: { name: 'tabbit-browser', version: '2.3.0' },
       });
       break;
     case 'notifications/initialized': break;
@@ -866,24 +1441,40 @@ async function handleMessage(msg) {
 }
 
 // ─── stdin 读取 ─────────────────────────────────────────────
+// 同时支持两种分帧：换行分隔(NDJSON，标准 MCP 客户端如 Claude Code 使用)
+// 与 Content-Length 分帧(LSP 风格)。输出统一为换行分隔。
 
 let buffer = '';
+function tryHandle(line) {
+  line = line.trim();
+  if (!line) return;
+  let msg;
+  try { msg = JSON.parse(line); } catch { return; } // 非 JSON 行直接忽略
+  try { handleMessage(msg); } catch {}
+}
+
 process.stdin.setEncoding('utf-8');
 process.stdin.on('data', (chunk) => {
   buffer += chunk;
   while (true) {
-    const headerEnd = buffer.indexOf('\r\n\r\n');
-    if (headerEnd === -1) break;
-    const header = buffer.substring(0, headerEnd);
-    const match = header.match(/Content-Length:\s*(\d+)/i);
-    if (!match) { buffer = buffer.substring(headerEnd + 4); continue; }
-    const contentLength = parseInt(match[1], 10);
-    const bodyStart = headerEnd + 4;
-    if (buffer.length < bodyStart + contentLength) break;
-    const body = buffer.substring(bodyStart, bodyStart + contentLength);
-    buffer = buffer.substring(bodyStart + contentLength);
-    try { handleMessage(JSON.parse(body)); } catch {}
+    // 优先尝试 Content-Length 分帧：仅在行首匹配时解析
+    const clMatch = buffer.match(/^\s*Content-Length:\s*(\d+)\s*\r?\n\r?\n/);
+    if (clMatch) {
+      const contentLength = parseInt(clMatch[1], 10);
+      const bodyStart = clMatch[0].length;
+      if (buffer.length < bodyStart + contentLength) break; // 等待更多数据
+      const body = buffer.substring(bodyStart, bodyStart + contentLength);
+      buffer = buffer.substring(bodyStart + contentLength);
+      tryHandle(body);
+      continue;
+    }
+    // 否则按换行分隔处理
+    const nl = buffer.indexOf('\n');
+    if (nl === -1) break;
+    const line = buffer.substring(0, nl);
+    buffer = buffer.substring(nl + 1);
+    tryHandle(line);
   }
 });
 process.stdin.on('end', () => process.exit(0));
-process.stderr.write('Tabbit Browser MCP Server v2.1.0 started\n');
+process.stderr.write('Tabbit Browser MCP Server v2.3.0 started\n');
