@@ -155,6 +155,14 @@ async function main() {
       // ─── 多标签命令 ──────────────────────────────
       case 'tabs': return await cmdTabs(args, client, sub);
 
+      // ─── MCP Server ──────────────────────────────
+      case 'mcp': {
+        // mcp-server 接管 stdin/stdout，CLI 连接先关掉
+        await client.close();
+        require('./mcp-server');
+        return;
+      }
+
       // ─── 批量命令 ────────────────────────────────
       case 'batch': return await cmdBatch(args, client, sub);
 

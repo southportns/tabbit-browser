@@ -65,14 +65,43 @@ node cli.js launch
 
 ### Claude Code / MiMoCode
 
-在 `~/.claude.json` 的 `mcpServers` 中添加：
+在 `~/.claude.json` 的 `mcpServers` 中添加，将路径替换为你 clone 的实际位置：
 
 ```json
 {
   "mcpServers": {
     "tabbit-browser": {
       "command": "node",
-      "args": ["C:\\path\\to\\tabbit-browser\\mcp-server.js"],
+      "args": ["/你的实际路径/tabbit-browser/mcp-server.js"],
+      "env": {
+        "TABBIT_PORT": "9222",
+        "TABBIT_CDP_TIMEOUT": "60000"
+      }
+    }
+  }
+}
+```
+
+例如 Windows 下 clone 到 `D:\projects\tabbit-browser`：
+
+```json
+"args": ["D:\\projects\\tabbit-browser\\mcp-server.js"]
+```
+
+也可以用 `npm link` 安装到全局，避免写长路径：
+
+```bash
+cd /你的实际路径/tabbit-browser
+npm link
+```
+
+然后配置简化为：
+
+```json
+{
+  "mcpServers": {
+    "tabbit-browser": {
+      "command": "tabbit-mcp",
       "env": {
         "TABBIT_PORT": "9222",
         "TABBIT_CDP_TIMEOUT": "60000"
@@ -84,12 +113,12 @@ node cli.js launch
 
 ### Codex
 
-在 `~/.codex/config.toml` 中添加：
+在 `~/.codex/config.toml` 中添加，同样替换为实际路径：
 
 ```toml
 [mcp_servers.tabbit-browser]
 command = "node"
-args = ["/path/to/tabbit-browser/mcp-server.js"]
+args = ["/你的实际路径/tabbit-browser/mcp-server.js"]
 ```
 
 ## MCP 工具列表 (21 个)
