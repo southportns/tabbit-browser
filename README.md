@@ -15,10 +15,11 @@ Tabbit 浏览器的全功能 CDP 自动化 MCP Server。通过 Chrome DevTools P
 - **存储管理** - 登录态导出/导入、localStorage 查看、一键清除
 
 ### 智能自动化
-- **智能元素操作** - 按文本/placeholder/选择器/ARIA role 定位元素，自动滚动到可见、等待出现、拟人点击与输入，多备选定位器耐改版
+- **智能元素操作** - 按文本/placeholder/选择器/ARIA role 定位元素，自动滚动到可见、等待出现、贝塞尔曲线拟人点击与输入，多备选定位器耐改版
 - **高级输入** - 鼠标点击、键盘输入、快捷键、滚动、拖拽、剪贴板操作
-- **智能导航** - 首屏自动注入反检测脚本、防风控等待、自动滚动触发懒加载
-- **反检测** - 隐藏 webdriver 标记、CDP 检测变量、权限查询覆盖
+- **智能导航** - 首屏自动注入反检测脚本、防风控等待、自动滚动触发懒加载、人类行为模拟
+- **反检测（14 项）** - navigator.webdriver 多层隐藏、CDP 检测变量动态清除、chrome.runtime 完整模拟、plugins/languages/connection 伪装、WebGL vendor/renderer 伪装、canvas 指纹噪声、Function.toString 防检测、visibilityState/outerWidth 覆盖、hardwareConcurrency 伪装
+- **人类行为模拟** - 贝塞尔曲线鼠标移动、随机偏移点击、逐字符自然输入、humanBrowse 浏览停留
 
 ### 数据提取与监控
 - **结构化提取** - 商品列表（京东/淘宝专用脚本）、表格、链接、图片、全文
@@ -149,8 +150,8 @@ args = ["/你的实际路径/tabbit-browser/mcp-server.js"]
 | `tabbit_element` | 智能元素操作：click/click-any/type/type-any/wait/get-text/scroll-into-view/upload/count。locator 支持 selector/text/placeholder/tag/role/index |
 | `tabbit_input` | 高级输入：click/type/key/hotkey/scroll/drag/select-all/copy/paste/cut/undo/redo |
 | `tabbit_tabs` | 多标签管理：list/open/close |
-| `tabbit_navigate` | 智能导航：自动注入反检测脚本 + 防风控等待 + 自动滚动触发懒加载 |
-| `tabbit_antidetect` | 注入反检测脚本到当前页面（隐藏 webdriver/CDP 标记） |
+| `tabbit_navigate` | 智能导航：自动注入反检测脚本 + 防风控等待 + 自动滚动 + 人类行为模拟（`humanBrowse=true`） |
+| `tabbit_antidetect` | 注入反检测脚本到当前页面（14 项反检测覆盖） |
 
 ### 数据提取与监控
 
@@ -241,11 +242,12 @@ mcp-server.js          MCP 协议入口 + 工具路由
 ├── CDP                 内联 WebSocket 连接管理（超时/事件/重连）
 ├── NetworkInterceptor  持久化网络拦截器（block/mock/throttle/log 跨调用保持）
 ├── DownloadTracker     持久化下载跟踪器
-└── ANTIDETECT_SCRIPT   反检测脚本（webdriver/CDP/权限/plugins/languages）
+└── ANTIDETECT_SCRIPT   反检测脚本（14 项覆盖，对标 go-rod/stealth）
 
 lib/
 ├── tabbit.js           TabbitClient + TabbitBrowser 核心连接
-├── element.js          ElementManager 智能元素定位（多维度匹配 + 拟人点击）
+├── element.js          ElementManager 智能元素定位（贝塞尔曲线拟人点击 + 多备选定位器）
+├── human.js            人类行为模拟（贝塞尔鼠标移动/随机延迟/自然输入/浏览停留）
 ├── content.js          ContentExtractor Readability 正文提取
 ├── monitor.js          MonitorManager 页面快照/轮询/差异对比
 ├── download.js         DownloadManager 下载事件监听
@@ -272,6 +274,27 @@ lib/
 - **NetworkInterceptor** — 跨工具调用保持 CDP 会话，block/mock/throttle 规则在页面切换时自动重连并保留
 - **DownloadTracker** — set-dir 后持续跟踪下载进度
 - **控制台日志** — `addScriptToEvaluateOnNewDocument` 注入 hook，跨导航持久捕获
+
+### 反检测能力
+
+对标 [go-rod/stealth](https://github.com/nicedoc/go-rod-stealth) 覆盖范围，14 项反检测：
+
+| 检测维度 | 覆盖方式 |
+|----------|----------|
+| `navigator.webdriver` | 多层隐藏（含 `__proto__`） |
+| CDP 检测变量 | 动态扫描 `window.cdc_*` 清除 |
+| `chrome.runtime` | 完整模拟（枚举 + connect/sendMessage） |
+| `navigator.permissions.query` | notifications 等查询覆盖 |
+| `navigator.plugins` | 6 个标准插件（含 item/namedItem/Symbol.iterator） |
+| `navigator.languages` | `['zh-CN', 'zh', 'en-US', 'en']` |
+| WebGL vendor/renderer | Intel Iris OpenGL Engine |
+| canvas 指纹 | toDataURL 添加微小随机噪声 |
+| `navigator.connection` | rtt/downlink/effectiveType 伪装 |
+| `Function.prototype.toString` | 防止原生代码检测 |
+| `document.hidden/visibilityState` | 始终为 visible |
+| `window.outerWidth/outerHeight` | 防 0 值暴露 |
+| `navigator.hardwareConcurrency` | ≤2 核时伪装为 8 |
+| 人类行为模拟 | 贝塞尔曲线鼠标移动 + 随机偏移点击 + 逐字符输入 + 浏览停留 |
 
 ## 技术栈
 
