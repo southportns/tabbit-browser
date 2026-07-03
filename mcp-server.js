@@ -32,32 +32,137 @@ const CDP_TIMEOUT = parseInt(process.env.TABBIT_CDP_TIMEOUT || '60000', 10);
 const COOKIES_DIR = path.join(process.env.HOME || process.env.USERPROFILE, '.tabbit-browser');
 
 // ─── 反检测脚本 ────────────────────────────────────────────
+// 对标 go-rod/stealth 覆盖范围，针对小红书等高风控站点增强
 
 const ANTIDETECT_SCRIPT = `
-  // 隐藏 webdriver 标记
+  // 1. 隐藏 webdriver 标记（多层防护）
   Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-  // 移除 CDP 检测变量
-  delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-  delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-  delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-  // 覆盖 chrome.runtime
-  if (window.chrome) window.chrome.runtime = window.chrome.runtime || {};
-  // 覆盖权限查询
-  const origQuery = window.navigator.permissions?.query;
-  if (origQuery) {
-    window.navigator.permissions.query = (p) =>
-      p.name === 'notifications'
-        ? Promise.resolve({ state: Notification.permission })
-        : origQuery(p);
+  delete navigator.__proto__.webdriver;
+
+  // 2. 移除 CDP 检测变量（Chrome DevTools Protocol 泄漏）
+  const cdcKeys = Object.keys(window).filter(k => k.startsWith('cdc_'));
+  cdcKeys.forEach(k => delete window[k]);
+  // 也检查 document 上的
+  if (document.cdc_adoQpoasnfa76pfcZLmcfl_Array) delete document.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+  if (document.cdc_adoQpoasnfa76pfcZLmcfl_Promise) delete document.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+  if (document.cdc_adoQpoasnfa76pfcZLmcfl_Symbol) delete document.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+
+  // 3. chrome.runtime 模拟（完整对象结构）
+  if (!window.chrome) window.chrome = {};
+  if (!window.chrome.runtime) {
+    window.chrome.runtime = {
+      PlatformOs: { MAC: 'mac', WIN: 'win', ANDROID: 'android', CROS: 'cros', LINUX: 'linux', OPENBSD: 'openbsd' },
+      PlatformArch: { ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64', MIPS: 'mips', MIPS64: 'mips64' },
+      PlatformNaclArch: { ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64', MIPS: 'mips', MIPS64: 'mips64' },
+      RequestUpdateCheckStatus: { THROTTLED: 'throttled', NO_UPDATE: 'no_update', UPDATE_AVAILABLE: 'update_available' },
+      OnInstalledReason: { INSTALL: 'install', UPDATE: 'update', CHROME_UPDATE: 'chrome_update', SHARED_MODULE_UPDATE: 'shared_module_update' },
+      OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
+      connect: function() { return { onMessage: { addListener: function() {} }, postMessage: function() {}, onDisconnect: { addListener: function() {} } }; },
+      sendMessage: function() {},
+      id: undefined,
+    };
   }
-  // 覆盖 plugins 长度
-  Object.defineProperty(navigator, 'plugins', {
-    get: () => [1, 2, 3, 4, 5],
-  });
-  // 覆盖 languages
-  Object.defineProperty(navigator, 'languages', {
-    get: () => ['zh-CN', 'zh', 'en'],
-  });
+
+  // 4. navigator.permissions 覆盖（完整 query 实现）
+  const origPermQuery = navigator.permissions?.query;
+  if (origPermQuery) {
+    navigator.permissions.query = (desc) => {
+      if (desc && desc.name === 'notifications') {
+        return Promise.resolve({ state: Notification.permission, onchange: null });
+      }
+      return origPermQuery.call(navigator.permissions, desc);
+    };
+  }
+
+  // 5. navigator.plugins 伪装（6 个标准插件，含 length 属性）
+  const fakePlugins = {
+    0: { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1, item: function(i) { return this[i]; } },
+    1: { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: '', length: 1, item: function(i) { return this[i]; } },
+    2: { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: '', length: 1, item: function(i) { return this[i]; } },
+    3: { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: '', length: 1, item: function(i) { return this[i]; } },
+    4: { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: '', length: 1, item: function(i) { return this[i]; } },
+    length: 5,
+    item: function(i) { return this[i]; },
+    namedItem: function(name) {
+      for (let i = 0; i < this.length; i++) {
+        if (this[i].name === name) return this[i];
+      }
+      return null;
+    },
+    refresh: function() {},
+    [Symbol.iterator]: function*() { for (let i = 0; i < this.length; i++) yield this[i]; },
+  };
+  Object.defineProperty(navigator, 'plugins', { get: () => fakePlugins });
+
+  // 6. navigator.languages 覆盖
+  Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
+  Object.defineProperty(navigator, 'language', { get: () => 'zh-CN' });
+
+  // 7. WebGL vendor/renderer 伪装（常见显卡）
+  const getParameter = WebGLRenderingContext.prototype.getParameter;
+  WebGLRenderingContext.prototype.getParameter = function(param) {
+    if (param === 37445) return 'Intel Inc.';
+    if (param === 37446) return 'Intel Iris OpenGL Engine';
+    return getParameter.call(this, param);
+  };
+  if (window.WebGL2RenderingContext) {
+    const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+    WebGL2RenderingContext.prototype.getParameter = function(param) {
+      if (param === 37445) return 'Intel Inc.';
+      if (param === 37446) return 'Intel Iris OpenGL Engine';
+      return getParameter2.call(this, param);
+    };
+  }
+
+  // 8. canvas 指纹噪声（toDataURL/toBlob 添加微小随机噪声）
+  const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+  HTMLCanvasElement.prototype.toDataURL = function(type) {
+    if (type === 'image/webp') return origToDataURL.apply(this, arguments);
+    const ctx = this.getContext('2d');
+    if (ctx) {
+      const shift = { r: Math.floor(Math.random() * 10) - 5, g: Math.floor(Math.random() * 10) - 5, b: Math.floor(Math.random() * 10) - 5 };
+      const imgData = ctx.getImageData(0, 0, Math.min(this.width, 16), Math.min(this.height, 16));
+      for (let i = 0; i < imgData.data.length; i += 4) {
+        imgData.data[i] += shift.r;
+        imgData.data[i+1] += shift.g;
+        imgData.data[i+2] += shift.b;
+      }
+      ctx.putImageData(imgData, 0, 0);
+    }
+    return origToDataURL.apply(this, arguments);
+  };
+
+  // 9. navigator.connection 覆盖（NetworkInformation API）
+  if (navigator.connection) {
+    Object.defineProperty(navigator.connection, 'rtt', { get: () => 50 });
+    Object.defineProperty(navigator.connection, 'downlink', { get: () => 10 });
+    Object.defineProperty(navigator.connection, 'effectiveType', { get: () => '4g' });
+  }
+
+  // 10. 覆盖 toString 检测（防止函数被 toString 后暴露原生代码）
+  const nativeToString = Function.prototype.toString;
+  Function.prototype.toString = function() {
+    if (this === navigator.permissions?.query?.toString) return 'function query() { [native code] }';
+    if (this === navigator.plugins?.length?.toString?.bind?.(navigator.plugins)) return '5';
+    return nativeToString.call(this);
+  };
+
+  // 11. 隐藏自动化相关 DOM 属性
+  Object.defineProperty(document, 'hidden', { get: () => false });
+  Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });
+
+  // 12. 防止 window.outerWidth/outerHeight 为 0（无头浏览器常见）
+  if (window.outerWidth === 0) Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth });
+  if (window.outerHeight === 0) Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight + 85 });
+
+  // 13. navigator.hardwareConcurrency 伪装（避免 1 核暴露）
+  if (navigator.hardwareConcurrency <= 2) {
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+  }
+
+  // 14. 覆盖 getOwnPropertyDescriptor 防止检测
+  const origGetOwnPropDesc = Object.getOwnPropertyDescriptor;
+  // 不覆盖，仅记录：部分检测脚本会检查 navigator 属性的 descriptor
 `;
 
 // ─── MCP 协议 ──────────────────────────────────────────────
@@ -474,7 +579,7 @@ const TOOLS = [
   // === 增强工具 ===
   {
     name: 'tabbit_navigate',
-    description: '智能导航：自动注入反检测脚本，支持防风控等待。用于访问淘宝/京东等有反爬的网站。',
+    description: '智能导航：自动注入反检测脚本，支持防风控等待、人类行为模拟。用于访问淘宝/京东/小红书等有反爬的网站。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -482,6 +587,8 @@ const TOOLS = [
         waitForLoad: { type: 'number', description: '等待加载时间(ms)，默认 3000' },
         autoScroll: { type: 'boolean', description: '自动滚动触发懒加载' },
         scrollTimes: { type: 'number', description: '滚动次数，默认 10' },
+        humanBrowse: { type: 'boolean', description: '开启人类行为模拟（随机停留/鼠标移动/滚动）' },
+        humanBrowseDuration: { type: 'number', description: '人类行为模拟持续时间(ms)，默认 3000' },
       },
       required: ['url'],
     },
@@ -888,6 +995,12 @@ async function executeTool(name, args) {
             await cdp.eval(`window.scrollBy(0, ${dist})`);
             await sleep(500 + Math.random() * 500);
           }
+        }
+
+        // 人类行为模拟：随机停留、鼠标移动、轻微滚动
+        if (args.humanBrowse) {
+          const { humanBrowse } = require('./lib/human');
+          await humanBrowse(cdp, args.humanBrowseDuration || 3000);
         }
 
         const title = await cdp.eval('document.title');
