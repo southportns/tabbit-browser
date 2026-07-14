@@ -1,11 +1,11 @@
-# Tabbit Browser MCP Server v2.3
+#Tabbit浏览器MCP服务器v2.3
 
 Tabbit 浏览器的全功能 CDP 自动化 MCP Server。通过 Chrome DevTools Protocol 操控 Tabbit 浏览器，提供 21 个工具覆盖 AI 对话、截图、设备仿真、网络管理、智能元素操作、数据提取、平台发布等场景。
 
 ## 功能特性
 
 ### 核心
-- **AI 对话** - 与 Tabbit 内置 Doubao AI 对话，支持流式输出
+- **AI 对话** - 与 Tabbit 内置 AI 对话，支持流式输出
 - **截图/PDF** - 视口截图、全页截图、元素截图、PDF 导出
 - **多标签管理** - 列出/新建/关闭标签页
 
