@@ -1,7 +1,7 @@
 {
   "name": "tabbit-browser",
-  "version": "2.0.0",
-  "description": "Tabbit Browser 全功能 CDP 自动化工具 - 网络拦截/设备仿真/存储管理/截图/PDF/多标签/批量任务",
+  "version": "2.3.0",
+  "description": "Tabbit Browser 全功能 CDP 自动化工具 - 高性能 MCP Server",
   "main": "lib/tabbit.js",
   "bin": {
     "tabbit": "./cli.js",
