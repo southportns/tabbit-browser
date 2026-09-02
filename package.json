@@ -1,6 +1,6 @@
 {
   "name": "tabbit-browser",
-  "version": "2.3.0",
+  "version": "2.7.0",
   "description": "Tabbit Browser 全功能 CDP 自动化工具 - 高性能 MCP Server",
   "main": "lib/tabbit.js",
   "bin": {

@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /**
- * Tabbit Browser MCP Server v2.6
+ * Tabbit Browser MCP Server v2.7
  *
- * 工具列表 (22 个):
- *   核心:    tabbit_chat, tabbit_screenshot, tabbit_pdf, tabbit_status, tabbit_launch, tabbit_new
+ * 工具列表 (24 个):
+ *   核心:    tabbit_chat, tabbit_screenshot, tabbit_pdf, tabbit_status, tabbit_launch,
+ *            tabbit_launch_isolated, tabbit_close_isolated, tabbit_new
  *   设备:    tabbit_device
  *   网络:    tabbit_network, tabbit_storage
  *   输入:    tabbit_input, tabbit_element
@@ -37,6 +38,14 @@ const PORT = parseInt(process.env.TABBIT_PORT || '9222', 10);
 const CDP_TIMEOUT = parseInt(process.env.TABBIT_CDP_TIMEOUT || '60000', 10);
 const COOKIES_DIR = path.join(process.env.HOME || process.env.USERPROFILE, '.tabbit-browser');
 
+// ─── 独立实例管理 ──────────────────────────────────────────
+// 独立浏览器实例：使用独立端口 + 独立 user-data-dir
+// 与用户的浏览器完全隔离，避免 MCP 操作和用户浏览冲突
+
+let _isolatedBrowser = null; // TabbitBrowser 独立实例
+let _isolatedPort = null;    // 独立实例的调试端口
+let _useIsolated = false;    // 是否使用独立实例模式
+
 // ─── 单例 Client + 会话池 ──────────────────────────────────
 // 跨工具调用复用 TabbitClient，避免每次创建新连接
 // 会话池按 target ID 缓存 CDP session，支持 TTL 过期
@@ -46,6 +55,12 @@ const _sessionPool = new Map(); // targetId -> { session, lastUsed }
 const SESSION_TTL = 30000; // 30 秒过期
 
 function getClient() {
+  if (_useIsolated && _isolatedPort) {
+    if (!_client || _client.port !== _isolatedPort) {
+      _client = new TabbitClient({ port: _isolatedPort });
+    }
+    return _client;
+  }
   if (!_client) _client = new TabbitClient({ port: PORT });
   return _client;
 }
@@ -81,6 +96,31 @@ const PAGE_CACHE_TTL = 5000;
 
 function invalidatePageCache() {
   _pageCache = { target: null, time: 0 };
+}
+
+// 切换到独立实例模式
+function switchToIsolated(port) {
+  _isolatedPort = port;
+  _useIsolated = true;
+  _client = null; // 重置 client，下次 getClient 会用新端口
+  invalidatePageCache();
+  _sessionPool.clear(); // 清空会话池
+  _hookedTargets.clear(); // 清空 hook 状态
+}
+
+// 切换回默认模式
+function switchToDefault() {
+  _useIsolated = false;
+  _isolatedPort = null;
+  _client = null;
+  invalidatePageCache();
+  _sessionPool.clear();
+  _hookedTargets.clear();
+}
+
+// 获取当前活跃端口（独立实例模式下返回独立端口，否则返回默认端口）
+function getCurrentPort() {
+  return _useIsolated && _isolatedPort ? _isolatedPort : PORT;
 }
 
 // ─── Console Hook 状态 ─────────────────────────────────────
@@ -316,12 +356,17 @@ class CDP {
 
 class NetworkInterceptor {
   constructor(port) {
-    this.port = port;
+    this._port = port;
     this.cdp = null;          // 持久 CDP 会话
     this.targetId = null;     // 当前附着的 target id
     this.rules = [];          // [{pattern, type:'block'|'mock', response, status}]
     this.requestLog = [];     // 累积请求日志（上限 500）
     this._throttle = null;    // 当前限速设置
+  }
+
+  // 动态获取当前端口（支持独立实例模式切换）
+  get port() {
+    return getCurrentPort();
   }
 
   async _findActiveTarget() {
@@ -456,12 +501,17 @@ const interceptor = new NetworkInterceptor(PORT);
 
 class DownloadTracker {
   constructor(port) {
-    this.port = port;
+    this._port = port;
     this.cdp = null;
     this.targetId = null;
     this.dir = path.join(process.env.HOME || process.env.USERPROFILE, 'Downloads', 'tabbit');
     this.records = [];
     this._mgr = getDownloadManager(null);
+  }
+
+  // 动态获取当前端口（支持独立实例模式切换）
+  get port() {
+    return getCurrentPort();
   }
 
   async _findActiveTarget() {
@@ -543,8 +593,22 @@ const TOOLS = [
   },
   {
     name: 'tabbit_launch',
-    description: '启动 Tabbit 浏览器（带调试端口）。',
+    description: '启动 Tabbit 浏览器（带调试端口）。注意：这会杀掉已有的浏览器进程。如果用户正在使用浏览器，请改用 tabbit_launch_isolated。',
     inputSchema: { type: 'object', properties: { killExisting: { type: 'boolean' } } },
+  },
+  {
+    name: 'tabbit_launch_isolated',
+    description: '启动独立浏览器实例（不影响用户正在使用的浏览器）。自动选择空闲端口和独立用户数据目录，MCP 所有操作都在这个独立实例中进行，与用户浏览互不干扰。',
+    inputSchema: { type: 'object', properties: {
+      executablePath: { type: 'string', description: '浏览器可执行文件路径（可选，默认 Tabbit Browser）' },
+      port: { type: 'number', description: '指定端口（可选，默认自动选择空闲端口）' },
+      userDataDir: { type: 'string', description: '用户数据目录（可选，默认在临时目录下创建）' },
+    } },
+  },
+  {
+    name: 'tabbit_close_isolated',
+    description: '关闭由 tabbit_launch_isolated 启动的独立浏览器实例。',
+    inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'tabbit_new',
@@ -871,16 +935,26 @@ async function executeTool(name, args) {
         return { content: [{ type: 'text', text: `PDF: ${result.path}` }], path: result.path };
       }
       case 'tabbit_status': {
+        const statusInfo = [];
+        // 如果处于独立实例模式，优先报告独立实例状态
+        if (_useIsolated) {
+          statusInfo.push(`[独立实例模式] 端口: ${_isolatedPort}`);
+        }
         let version;
         try {
-          version = await client.getVersion();  // 一次 HTTP 同时验证运行状态和获取版本
+          version = await client.getVersion();
         } catch {
-          return { content: [{ type: 'text', text: 'Tabbit 未运行' }], status: 'disconnected' };
+          const msg = _useIsolated ? '独立实例未运行' : 'Tabbit 未运行';
+          return { content: [{ type: 'text', text: statusInfo.length ? `${statusInfo.join('\n')}\n${msg}` : msg }], status: 'disconnected', isolated: _useIsolated, isolatedPort: _isolatedPort };
         }
         const targets = await client.getTargets();
+        const pages = targets.filter(t => t.type === 'page');
+        statusInfo.push(`${version.Browser} | ${pages.length} pages`);
         return {
-          content: [{ type: 'text', text: `${version.Browser} | ${targets.filter(t => t.type === 'page').length} pages` }],
+          content: [{ type: 'text', text: statusInfo.join('\n') }],
           status: 'connected', browser: version.Browser,
+          isolated: _useIsolated, isolatedPort: _isolatedPort,
+          pages: pages.map(p => ({ title: p.title, url: p.url })),
         };
       }
       case 'tabbit_launch': {
@@ -890,6 +964,44 @@ async function executeTool(name, args) {
         _client = null; // 新浏览器实例，重置单例 Client
         invalidatePageCache();
         return { content: [{ type: 'text', text: `已启动 (port ${PORT})` }] };
+      }
+      case 'tabbit_launch_isolated': {
+        // 如果已有独立实例在运行，直接返回
+        if (_isolatedBrowser && await _isolatedBrowser.isRunning()) {
+          switchToIsolated(_isolatedBrowser.port);
+          return { content: [{ type: 'text', text: `独立实例已在运行 (port ${_isolatedBrowser.port})` }], port: _isolatedBrowser.port, mode: 'isolated' };
+        }
+        // 创建新的独立浏览器实例
+        const launchOpts = { isolated: true };
+        if (args.executablePath) launchOpts.executablePath = args.executablePath;
+        if (args.port) launchOpts.port = args.port;
+        if (args.userDataDir) launchOpts.userDataDir = args.userDataDir;
+        _isolatedBrowser = new TabbitBrowser(launchOpts);
+        await _isolatedBrowser.launch({ killExisting: false });
+        // 切换 MCP 上下文到独立实例
+        switchToIsolated(_isolatedBrowser.port);
+        // 在独立实例中打开一个新标签页作为初始页面
+        const newClient = getClient();
+        try {
+          await newClient.openInNewTab('about:blank');
+        } catch {}
+        return {
+          content: [{ type: 'text', text: `独立浏览器实例已启动\n端口: ${_isolatedBrowser.port}\n用户数据目录: ${_isolatedBrowser.userDataDir || '(默认)'}\n\nMCP 所有后续操作将在此独立实例中进行，不影响用户正在使用的浏览器。` }],
+          port: _isolatedBrowser.port,
+          userDataDir: _isolatedBrowser.userDataDir,
+          mode: 'isolated',
+        };
+      }
+      case 'tabbit_close_isolated': {
+        if (!_isolatedBrowser) {
+          return { content: [{ type: 'text', text: '没有运行中的独立实例' }] };
+        }
+        const closedPort = _isolatedBrowser.port;
+        const closedDir = _isolatedBrowser.userDataDir;
+        await _isolatedBrowser.close();
+        _isolatedBrowser = null;
+        switchToDefault();
+        return { content: [{ type: 'text', text: `独立实例已关闭 (端口 ${closedPort})` }], closedPort, closedDir };
       }
       case 'tabbit_new': {
         await client.openInNewTab('https://web.tabbit.com/newtab');
@@ -1032,11 +1144,11 @@ async function executeTool(name, args) {
       case 'tabbit_tabs': {
         switch (args.action) {
           case 'list': { const t = await client.getTargets(); const p = t.filter(x => x.type === 'page'); return { content: [{ type: 'text', text: p.map(x => `${x.id}  ${x.title}  ${x.url}`).join('\n') || '(无标签页)' }], tabs: p.map(x => ({ id: x.id, title: x.title, url: x.url })) }; }
-          case 'open': { const mt = getMultiTabManager({ port: PORT }); const id = await mt.createTab(args.url || 'https://web.tabbit.com/newtab'); await mt.closeAll(); invalidatePageCache(); return { content: [{ type: 'text', text: `新标签已打开: ${id}` }], targetId: id }; }
+          case 'open': { const mt = getMultiTabManager({ port: getCurrentPort() }); const id = await mt.createTab(args.url || 'https://web.tabbit.com/newtab'); await mt.closeAll(); invalidatePageCache(); return { content: [{ type: 'text', text: `新标签已打开: ${id}` }], targetId: id }; }
           case 'close': {
             if (!args.targetId) throw new Error('close 需要 targetId 参数（来自 list 输出的 id）');
-            const mt = getMultiTabManager({ port: PORT });
-            await mt.closeTab(args.targetId); await mt.closeAll(); invalidatePageCache();
+const mt = getMultiTabManager({ port: getCurrentPort() });
+await mt.closeTab(args.targetId); await mt.closeAll(); invalidatePageCache();
             return { content: [{ type: 'text', text: `已关闭: ${args.targetId}` }] };
           }
           default: throw new Error(`未知操作`);
@@ -2139,7 +2251,7 @@ async function handleMessage(msg) {
       sendResponse(id, {
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'tabbit-browser', version: '2.6.0' },
+        serverInfo: { name: 'tabbit-browser', version: '2.7.0' },
       });
       break;
     case 'notifications/initialized': break;
@@ -2196,4 +2308,4 @@ process.stdin.on('data', (chunk) => {
   }
 });
 process.stdin.on('end', () => process.exit(0));
-process.stderr.write('Tabbit Browser MCP Server v2.6.0 started (external agent)\n');
+process.stderr.write('Tabbit Browser MCP Server v2.7.0 started (external agent)\n');

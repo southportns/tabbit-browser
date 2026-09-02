@@ -74,6 +74,8 @@ Tabbit Browser 工具 v2.0 - 全功能浏览器自动化
   chat <msg>              发送消息    chat -i 交互式
   new                     新对话      list    列出页面
   status                  连接状态    launch  启动 Tabbit
+  launch-iso              启动独立实例（不影响用户浏览器）
+  close-iso               关闭独立实例
 
 网络:
   net log                 请求日志    net mock <url> <json>
@@ -131,6 +133,8 @@ async function main() {
     switch (command) {
       case 'status': return await cmdStatus(browser);
       case 'launch': return await cmdLaunch(browser);
+      case 'launch-iso': return await cmdLaunchIsolated(browser, args);
+      case 'close-iso': return await cmdCloseIsolated();
       case 'list': return await cmdList(client);
       case 'chat': return await cmdChat(args, client, waitMs);
       case 'new': return await cmdNew(client);
@@ -207,6 +211,25 @@ async function cmdLaunch(browser) {
   console.log('启动 Tabbit...');
   await browser.launch();
   console.log('Tabbit 已启动，调试端口:', browser.port);
+}
+
+async function cmdLaunchIsolated(browser, args) {
+  const port = getArg(args, '--port');
+  const userDataDir = getArg(args, '--user-data-dir');
+  const opts = { isolated: true };
+  if (port) opts.port = parseInt(port, 10);
+  if (userDataDir) opts.userDataDir = userDataDir;
+  const isoBrowser = new TabbitBrowser(opts);
+  console.log('启动独立浏览器实例...');
+  await isoBrowser.launch({ killExisting: false });
+  console.log(`独立实例已启动，端口: ${isoBrowser.port}，数据目录: ${isoBrowser.userDataDir}`);
+}
+
+let _isolatedBrowserRef = null;
+
+async function cmdCloseIsolated() {
+  // CLI 模式下独立实例是一次性的，这里仅作占位
+  console.log('CLI 模式下请手动关闭独立实例进程');
 }
 
 async function cmdList(client) {

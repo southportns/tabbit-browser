@@ -1,6 +1,8 @@
-# Tabbit Browser MCP Server v2.6
+# Tabbit Browser MCP Server v2.7
 
-Tabbit 浏览器的全功能 CDP 自动化 MCP Server。通过 Chrome DevTools Protocol 操控 Tabbit 浏览器，提供 22 个工具覆盖 AI 对话、截图、设备仿真、网络管理、智能元素操作、数据提取、平台发布等场景。
+Tabbit 浏览器的全功能 CDP 自动化 MCP Server。通过 Chrome DevTools Protocol 操控 Tabbit 浏览器，提供 24 个工具覆盖 AI 对话、截图、设备仿真、网络管理、智能元素操作、数据提取、平台发布等场景。
+
+**v2.7 重点更新**：新增独立浏览器实例模式（`tabbit_launch_isolated`），MCP 操作在独立实例中进行，与用户正在使用的浏览器互不干扰。
 
 **v2.6 重点优化**：会话池复用、HTTP keep-alive、MutationObserver 事件驱动、懒加载模块、并行化处理，平均响应速度提升 40-60%。
 
@@ -124,7 +126,7 @@ command = "node"
 args = ["/你的实际路径/tabbit-browser/mcp-server.js"]
 ```
 
-## MCP 工具列表 (22 个)
+## MCP 工具列表 (24 个)
 
 ### 核心
 
@@ -134,7 +136,9 @@ args = ["/你的实际路径/tabbit-browser/mcp-server.js"]
 | `tabbit_screenshot` | 截图（视口/全页/元素，支持 jpeg/png/webp） |
 | `tabbit_pdf` | 将页面导出为 PDF |
 | `tabbit_status` | 检查 Tabbit 连接状态、浏览器版本、页面列表 |
-| `tabbit_launch` | 启动 Tabbit 浏览器（带调试端口） |
+| `tabbit_launch` | 启动 Tabbit 浏览器（带调试端口）。注意：会杀掉已有浏览器进程 |
+| `tabbit_launch_isolated` | **新增** 启动独立浏览器实例，不影响用户正在使用的浏览器。自动选择空闲端口和独立用户数据目录 |
+| `tabbit_close_isolated` | **新增** 关闭由 `tabbit_launch_isolated` 启动的独立浏览器实例 |
 | `tabbit_new` | 打开新对话页面 |
 
 ### 设备与网络
@@ -172,6 +176,52 @@ args = ["/你的实际路径/tabbit-browser/mcp-server.js"]
 | `tabbit_cookies` | Cookie 持久化：save/load/list/save-all/load-all（并行化处理），存入 `~/.tabbit-browser/` |
 | `tabbit_publish` | 多平台发布：xhs/douyin/weibo/zhihu/bilibili/wechat，支持 dryRun 预览 |
 | `tabbit_task` | AI 任务管理：create/status/stop/list（依赖 Tabbit 内置 AI） |
+
+## v2.7 新增：独立浏览器实例模式
+
+### 问题场景
+
+当用户正在使用浏览器浏览页面时，MCP 工具也需要操作浏览器（截图、导航、提取数据等），两者操作的是同一个浏览器实例，会产生冲突：
+- MCP 导航到页面 A，但用户正在看页面 B
+- MCP 的截图/输入操作干扰用户正在进行的浏览
+
+### 解决方案
+
+使用 `tabbit_launch_isolated` 启动一个**完全独立的浏览器实例**：
+- **独立调试端口** — 自动从 9223 开始寻找空闲端口，与用户的 9222 端口互不干扰
+- **独立用户数据目录** — 在系统临时目录下创建独立的 user-data-dir，Cookie/缓存/登录态完全隔离
+- **独立浏览器进程** — MCP 启动的浏览器有自己的进程 ID，关闭时只杀自己启动的进程
+
+### 使用方式
+
+```
+# MCP 工具调用顺序：
+1. tabbit_launch_isolated    → 启动独立浏览器实例
+2. tabbit_navigate           → 在独立实例中导航到目标页面
+3. tabbit_screenshot/extract → 在独立实例中操作
+...
+N. tabbit_close_isolated     → 用完后关闭独立实例
+```
+
+也可以在 CLI 中使用：
+
+```bash
+# 启动独立实例
+node cli.js launch-iso
+
+# 指定端口和数据目录
+node cli.js launch-iso --port 9333 --user-data-dir C:/tabbit-mcp-data
+```
+
+### 与原有模式的关系
+
+| 特性 | `tabbit_launch` (原有) | `tabbit_launch_isolated` (新增) |
+|------|------------------------|----------------------------------|
+| 端口 | 9222 (固定) | 9223+ (自动选择空闲端口) |
+| user-data-dir | 默认 (与用户共享) | 独立临时目录 |
+| killExisting | 默认杀掉已有进程 | 不杀任何已有进程 |
+| 进程管理 | 无 | 保存 PID，`close` 时精确关闭 |
+| 与用户冲突 | 是 | 否 |
 
 ## 性能优化（v2.6）
 
@@ -215,6 +265,12 @@ args = ["/你的实际路径/tabbit-browser/mcp-server.js"]
 除了 MCP，也可以直接通过命令行使用：
 
 ```bash
+# 启动独立实例（不影响用户正在使用的浏览器）
+node cli.js launch-iso
+
+# 指定端口和数据目录
+node cli.js launch-iso --port 9333 --user-data-dir C:/tabbit-mcp-data
+
 # 发送消息
 node cli.js chat "你好"
 
