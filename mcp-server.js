@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Tabbit Browser MCP Server v2.7
+ * Tabbit Browser MCP Server v2.8
  *
  * 工具列表 (24 个):
  *   核心:    tabbit_chat, tabbit_screenshot, tabbit_pdf, tabbit_status, tabbit_launch,
@@ -558,7 +558,7 @@ const TOOLS = [
   // === 核心工具 ===
   {
     name: 'tabbit_chat',
-    description: '发送消息给 Tabbit AI 并获取回复。',
+    description: '发送消息给 Tabbit AI 并获取回复。当用户需要：与AI对话、问AI问题、使用豆包聊天、发送消息给AI助手、AI聊天时使用此工具。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -570,7 +570,7 @@ const TOOLS = [
   },
   {
     name: 'tabbit_screenshot',
-    description: '对当前页面截图（视口/全页/元素）。',
+    description: '对当前页面截图（视口/全页/元素）。当用户需要：截图、截屏、网页截图、页面快照、屏幕捕获、保存页面图片、全页截图、元素截图时使用此工具。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -583,22 +583,22 @@ const TOOLS = [
   },
   {
     name: 'tabbit_pdf',
-    description: '将当前页面导出为 PDF。',
+    description: '将当前页面导出为 PDF。当用户需要：导出PDF、网页转PDF、保存为PDF、打印页面时使用此工具。',
     inputSchema: { type: 'object', properties: { outputPath: { type: 'string' } } },
   },
   {
     name: 'tabbit_status',
-    description: '检查 Tabbit 连接状态。',
+    description: '检查 Tabbit 连接状态。当用户需要：检查浏览器状态、查看连接、确认浏览器是否运行、Tabbit状态时使用此工具。',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'tabbit_launch',
-    description: '启动 Tabbit 浏览器（带调试端口）。注意：这会杀掉已有的浏览器进程。如果用户正在使用浏览器，请改用 tabbit_launch_isolated。',
+    description: '启动 Tabbit 浏览器（带调试端口）。注意：这会杀掉已有的浏览器进程。如果用户正在使用浏览器，请改用 tabbit_launch_isolated。当用户需要：启动浏览器、打开Tabbit、初始化浏览器时使用此工具。',
     inputSchema: { type: 'object', properties: { killExisting: { type: 'boolean' } } },
   },
   {
     name: 'tabbit_launch_isolated',
-    description: '启动独立浏览器实例（不影响用户正在使用的浏览器）。自动选择空闲端口和独立用户数据目录，MCP 所有操作都在这个独立实例中进行，与用户浏览互不干扰。',
+    description: '启动独立浏览器实例（不影响用户正在使用的浏览器）。自动选择空闲端口和独立用户数据目录，MCP 所有操作都在这个独立实例中进行，与用户浏览互不干扰。当用户需要：启动独立浏览器、后台浏览器、不影响当前浏览时使用此工具。',
     inputSchema: { type: 'object', properties: {
       executablePath: { type: 'string', description: '浏览器可执行文件路径（可选，默认 Tabbit Browser）' },
       port: { type: 'number', description: '指定端口（可选，默认自动选择空闲端口）' },
@@ -607,18 +607,18 @@ const TOOLS = [
   },
   {
     name: 'tabbit_close_isolated',
-    description: '关闭由 tabbit_launch_isolated 启动的独立浏览器实例。',
+    description: '关闭由 tabbit_launch_isolated 启动的独立浏览器实例。当用户需要：关闭独立浏览器、清理浏览器实例时使用此工具。',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'tabbit_new',
-    description: '打开新对话页面。',
+    description: '打开新对话页面。当用户需要：新开对话、打开新标签对话、开始新的AI会话时使用此工具。',
     inputSchema: { type: 'object', properties: {} },
   },
   // === 设备 ===
   {
     name: 'tabbit_device',
-    description: '设备仿真（视口/UA/深色模式/定位）。',
+    description: '设备仿真（视口/UA/深色模式/定位）。当用户需要：模拟手机、iPhone模式、Android模拟、设备测试、移动端预览、切换视口、深色模式、暗色模式、地理定位、时区切换、触摸仿真时使用此工具。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -635,7 +635,7 @@ const TOOLS = [
   // === 网络 ===
   {
     name: 'tabbit_network',
-    description: '网络管理（Cookie/拦截/Mock/限速/请求日志）。block/mock/throttle/log 基于持久化拦截器，跨调用生效。',
+    description: '网络管理（Cookie/拦截/Mock/限速/请求日志）。block/mock/throttle/log 基于持久化拦截器，跨调用生效。当用户需要：查看Cookie、导出导入Cookie、屏蔽请求、拦截广告、Mock API响应、网络限速、模拟3G/4G、清除缓存、查看请求日志、网络调试时使用此工具。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -659,7 +659,7 @@ const TOOLS = [
   // === 存储 ===
   {
     name: 'tabbit_storage',
-    description: '存储管理（登录态导出/导入/清除）。',
+    description: '存储管理（登录态导出/导入/清除）。当用户需要：导出登录态、导入登录态、清除网站存储、查看localStorage、管理浏览器存储时使用此工具。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -673,7 +673,7 @@ const TOOLS = [
   // === 输入 ===
   {
     name: 'tabbit_input',
-    description: '高级输入（点击/键盘/快捷键/滚动/拖拽/剪贴板）。',
+    description: '高级输入（点击/键盘/快捷键/滚动/拖拽/剪贴板）。当用户需要：鼠标点击坐标、键盘输入、按键、快捷键、滚动页面、拖拽元素、复制粘贴、全选、撤销重做时使用此工具。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -691,7 +691,7 @@ const TOOLS = [
   // === 标签 ===
   {
     name: 'tabbit_tabs',
-    description: '多标签管理。list 返回的 id 即 close 所需的 targetId。',
+    description: '多标签管理。list 返回的 id 即 close 所需的 targetId。当用户需要：列出标签页、打开新标签、关闭标签、标签管理时使用此工具。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -705,7 +705,7 @@ const TOOLS = [
   // === 增强工具 ===
   {
     name: 'tabbit_navigate',
-    description: '智能导航：自动注入反检测脚本，支持防风控等待、人类行为模拟。用于访问淘宝/京东/小红书等有反爬的网站。',
+    description: '智能导航：自动注入反检测脚本，支持防风控等待、人类行为模拟。用于访问淘宝/京东/小红书等有反爬的网站。当用户需要：打开网页、访问网站、导航到URL、浏览页面、去某个网站、查看网页时使用此工具。优先使用此工具而非编写爬虫脚本。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -721,7 +721,7 @@ const TOOLS = [
   },
   {
     name: 'tabbit_extract',
-    description: '从当前页面提取结构化数据。支持：商品列表(goods)、表格(table)、链接(links)、图片(images)、全文(text)。',
+    description: '从当前页面提取结构化数据。支持：商品列表(goods)、表格(table)、链接(links)、图片(images)、全文(text)。当用户需要：提取数据、爬取网页、抓取商品信息、获取表格数据、提取链接、获取图片列表、页面数据采集、爬虫时使用此工具。优先使用此工具而非编写爬虫代码。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -745,12 +745,12 @@ const TOOLS = [
   },
   {
     name: 'tabbit_antidetect',
-    description: '注入反检测脚本到当前页面，隐藏自动化标记。访问反爬网站前调用。',
+    description: '注入反检测脚本到当前页面，隐藏自动化标记。访问反爬网站前调用。当用户需要：反检测、隐藏自动化、反爬虫、绕过检测、stealth mode时使用此工具。',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'tabbit_cookies',
-    description: 'Cookie 持久化：保存/加载/列出站点的 Cookie。',
+    description: 'Cookie 持久化：保存/加载/列出站点的 Cookie。当用户需要：保存Cookie、加载Cookie、管理登录态、保存登录、恢复登录、列出站点Cookie时使用此工具。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -762,7 +762,7 @@ const TOOLS = [
   },
   {
     name: 'tabbit_console',
-    description: '控制台日志抓取：查看/过滤/清空浏览器控制台输出。用于项目调试。',
+    description: '控制台日志抓取：查看/过滤/清空浏览器控制台输出。用于项目调试。当用户需要：查看控制台、Console日志、调试错误、浏览器日志、控制台输出、查看JS错误时使用此工具。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -786,7 +786,7 @@ const TOOLS = [
   // === 智能元素操作 ===
   {
     name: 'tabbit_element',
-    description: '智能元素操作：按文本/placeholder/选择器定位元素，自动滚动到可见、等待出现、健壮点击与输入。是发布、录制等自动化的底座，比坐标点击更耐改版。locator 用 {selector|text|placeholder|tag|role,index}。',
+    description: '智能元素操作：按文本/placeholder/选择器定位元素，自动滚动到可见、等待出现、健壮点击与输入。是发布、录制等自动化的底座，比坐标点击更耐改版。locator 用 {selector|text|placeholder|tag|role,index}。当用户需要：点击按钮、点击元素、输入文本、填写表单、等待元素出现、获取元素文本、滚动到元素、上传文件、元素定位时使用此工具。优先使用此工具而非坐标点击。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -815,7 +815,7 @@ const TOOLS = [
   // === 正文提取 ===
   {
     name: 'tabbit_readability',
-    description: '智能正文提取：注入 Readability 算法按文本密度提取主体、去广告导航，转为 Markdown。适合把网页文章转成干净文本。',
+    description: '智能正文提取：注入 Readability 算法按文本密度提取主体、去广告导航，转为 Markdown。适合把网页文章转成干净文本。当用户需要：提取正文、读取文章、获取主要内容、文章正文、网页正文、阅读模式、markdown转换时使用此工具。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -829,7 +829,7 @@ const TOOLS = [
   // === 下载管理 ===
   {
     name: 'tabbit_download',
-    description: '下载管理：设置下载目录、查看下载记录。set-dir 后该页面的下载会自动记录。',
+    description: '下载管理：设置下载目录、查看下载记录。set-dir 后该页面的下载会自动记录。当用户需要：设置下载目录、查看下载记录、管理下载、下载文件管理时使用此工具。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -843,7 +843,7 @@ const TOOLS = [
   // === 页面监控 ===
   {
     name: 'tabbit_monitor',
-    description: '页面监控：对页面区域取快照、轮询检测变化、对比差异。适合监控价格/库存/帖子数据。watch 会阻塞至变化或超时。',
+    description: '页面监控：对页面区域取快照、轮询检测变化、对比差异。适合监控价格/库存/帖子数据。watch 会阻塞至变化或超时。当用户需要：监控页面、检测变化、页面快照、价格监控、库存监控、内容变化检测时使用此工具。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -862,7 +862,7 @@ const TOOLS = [
   // === 平台发布 ===
   {
     name: 'tabbit_publish',
-    description: '多平台自动发布：小红书/抖音/微博/知乎/B站/微信公众号。用文本定位耐改版。需先在浏览器登录并用 tabbit_cookies 保存登录态。首次建议 dryRun=true。',
+    description: '多平台自动发布：小红书/抖音/微博/知乎/B站/微信公众号。用文本定位耐改版。需先在浏览器登录并用 tabbit_cookies 保存登录态。首次建议 dryRun=true。当用户需要：发布到小红书、发抖音、发微博、发知乎、发B站、发微信公众号、自动发布、社交媒体发布时使用此工具。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -887,7 +887,7 @@ const TOOLS = [
   // === AI 任务 ===
   {
     name: 'tabbit_task',
-    description: 'AI 任务管理：发送自然语言任务，Tabbit AI 在后台自动执行。支持创建、查询状态、停止任务。任务在独立标签页中运行，不阻塞用户操作。',
+    description: 'AI 任务管理：发送自然语言任务，Tabbit AI 在后台自动执行。支持创建、查询状态、停止任务。任务在独立标签页中运行，不阻塞用户操作。当用户需要：创建AI任务、后台任务、自动执行任务、任务状态查询、停止任务、列出任务时使用此工具。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2251,7 +2251,7 @@ async function handleMessage(msg) {
       sendResponse(id, {
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'tabbit-browser', version: '2.7.0' },
+        serverInfo: { name: 'tabbit-browser', version: '2.8.0' },
       });
       break;
     case 'notifications/initialized': break;
@@ -2308,4 +2308,4 @@ process.stdin.on('data', (chunk) => {
   }
 });
 process.stdin.on('end', () => process.exit(0));
-process.stderr.write('Tabbit Browser MCP Server v2.7.0 started (external agent)\n');
+process.stderr.write('Tabbit Browser MCP Server v2.8.0 started (external agent)\n');

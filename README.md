@@ -1,6 +1,8 @@
-# Tabbit Browser MCP Server v2.7
+# Tabbit Browser MCP Server v2.8
 
 Tabbit 浏览器的全功能 CDP 自动化 MCP Server。通过 Chrome DevTools Protocol 操控 Tabbit 浏览器，提供 24 个工具覆盖 AI 对话、截图、设备仿真、网络管理、智能元素操作、数据提取、平台发布等场景。
+
+**v2.8 重点更新**：新增 Agent 智能触发机制（SKILL.md），增强所有 24 个工具的描述，让 AI Agent 能根据用户需求自动触发对应的 MCP 工具，无需手动指定。
 
 **v2.7 重点更新**：新增独立浏览器实例模式（`tabbit_launch_isolated`），MCP 操作在独立实例中进行，与用户正在使用的浏览器互不干扰。
 
@@ -34,6 +36,76 @@ Tabbit 浏览器的全功能 CDP 自动化 MCP Server。通过 Chrome DevTools P
 ### 下载与发布
 - **下载管理** - 设置下载目录、监听下载进度、查看下载记录
 - **多平台发布** - 小红书/抖音/微博/知乎/B站/微信公众号自动填表发布（需先登录保存 Cookie）
+
+## Agent 智能触发机制（v2.8 新增）
+
+### 问题
+
+在 AI Agent（如 Claude Code、CatPaw、TRAE 等）使用 MCP 时，Agent 经常无法根据用户需求自动触发对应的 MCP 工具。例如用户说"帮我截个网页截图"，Agent 可能不会自动调用 `tabbit_screenshot`，而是尝试编写独立的截图代码。
+
+### 解决方案
+
+v2.8 引入了双层触发机制：
+
+#### 1. SKILL.md 智能触发文件
+
+项目根目录新增 `SKILL.md` 文件，这是一个 Agent Skill 定义文件，包含：
+
+- **24 个工具的完整触发关键词映射** — 每个工具都列出了中文/英文触发关键词
+- **触发场景示例** — 列出用户可能说的自然语言请求，帮助 Agent 识别
+- **使用优先级指引** — 明确告诉 Agent 何时应优先使用 MCP 工具而非编写独立代码
+- **典型工作流** — 提供端到端场景示例（爬取商品、发布内容、调试网页等）
+
+Agent 在检测到用户请求涉及浏览器操作时，会自动读取 `SKILL.md` 并根据指引调用正确的 MCP 工具。
+
+#### 2. 工具描述增强
+
+所有 24 个工具的 `description` 字段都增加了触发场景描述，格式为：
+
+```
+<原有功能描述>。当用户需要：<触发关键词列表>时使用此工具。
+```
+
+这使得 Agent 在调用 `tools/list` 获取工具列表时，就能看到每个工具的适用场景，从而更准确地匹配用户意图。
+
+### 触发关键词覆盖
+
+| 场景 | 触发关键词示例 | 对应工具 |
+|------|---------------|----------|
+| 网页导航 | 打开网页、访问网站、导航到 | `tabbit_navigate` |
+| 截图 | 截图、截屏、网页截图 | `tabbit_screenshot` |
+| 数据提取 | 提取数据、爬取、抓取商品 | `tabbit_extract` |
+| 正文提取 | 提取正文、文章正文、阅读模式 | `tabbit_readability` |
+| 元素操作 | 点击按钮、输入文本、填写表单 | `tabbit_element` |
+| AI对话 | 和AI对话、问AI、豆包对话 | `tabbit_chat` |
+| 设备仿真 | 模拟手机、iPhone模式、深色模式 | `tabbit_device` |
+| Cookie管理 | 保存Cookie、加载登录态 | `tabbit_cookies` |
+| 网络管理 | 屏蔽请求、Mock响应、限速 | `tabbit_network` |
+| 平台发布 | 发布到小红书、发抖音、发微博 | `tabbit_publish` |
+| 控制台调试 | 查看控制台、Console日志 | `tabbit_console` |
+| 页面监控 | 监控价格、检测变化 | `tabbit_monitor` |
+| PDF导出 | 导出PDF、网页转PDF | `tabbit_pdf` |
+| AI任务 | 创建AI任务、后台任务 | `tabbit_task` |
+
+### 配置触发机制
+
+在 CatPaw 中配置 SKILL.md 路径，使其能被 Agent 自动发现：
+
+```json
+{
+  "mcpServers": {
+    "tabbit-browser": {
+      "command": "node",
+      "args": ["/你的实际路径/tabbit-browser/mcp-server.js"],
+      "env": {
+        "TABBIT_PORT": "9222"
+      }
+    }
+  }
+}
+```
+
+SKILL.md 文件位于项目根目录，Agent 会自动扫描并加载。如需手动指定，可在 Agent 配置中添加 skill 路径指向 `SKILL.md`。
 
 ## 安装
 
